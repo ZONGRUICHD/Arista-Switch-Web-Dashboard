@@ -2,22 +2,32 @@
 
 ## 部署方法
 
-把 on-box WebUI 上传到交换机：
-
-```powershell
-scp .\onbox\arista7050_web.py admin@交换机IP:/mnt/flash/arista7050_web.py
-ssh admin@交换机IP
-```
-
-在 EOS 上运行：
+在交换机上进入 enable 和 bash：
 
 ```text
 enable
 bash
-python3 /mnt/flash/arista7050_web.py --host 0.0.0.0 --port 2480 --daemon
 ```
 
-在 EOS control-plane ACL 中放行 TCP/2480：
+一条命令安装或更新 WebUI：
+
+```text
+curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | sh
+```
+
+自定义端口或分支：
+
+```text
+curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | PORT=2480 BRANCH=master sh
+```
+
+可选开启 Basic 登录认证：
+
+```text
+curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | WEB_USERNAME=admin WEB_PASSWORD=你的密码 sh
+```
+
+如需从 EOS control-plane ACL 放行 TCP/2480：
 
 ```text
 configure terminal
@@ -33,6 +43,8 @@ write memory
 ```text
 http://交换机IP:2480/
 ```
+
+实现方式：WebUI 是部署在交换机 `/mnt/flash` 的 on-box Python 程序，运行时在 EOS bash 里通过本机 `Cli` / `FastCli` 执行只读 `show` 命令和受控配置模板；不是 eAPI，也不是外部 SSH 代理服务。安装脚本只是用 curl 下载文件并重启 WebUI 进程，默认不修改交换机配置。
 
 ## TODO
 
@@ -71,6 +83,7 @@ http://交换机IP:2480/
 - [x] SVI 创建模板。
 - [x] OSPF interface area 配置模板。
 - [x] BGP address-family activate/deactivate 模板。
+- [x] 一条命令安装/更新脚本：`install.sh`。
 
 ### 部分完成 / 需要更多验证
 
