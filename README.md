@@ -58,6 +58,19 @@ http://交换机IP:2480/
 - [x] 受控配置 API，执行前必须传入 `confirm: "APPLY"`。
 - [x] 配置操作 dry-run 预览。
 - [x] 配置模板：端口启停、接口描述、创建 VLAN、接口加入 VLAN、三层接口、OSPF network、BGP neighbor。
+- [x] 光模块基础采集：`show interfaces transceiver` / detail。
+- [x] 光模块 DOM 字段解析：温度、TX/RX 光功率、序列号、厂商、型号、阈值/告警原始行。
+- [x] 支持机型的 PoE 状态采集和 PoE 启停模板。
+- [x] 接口计数器历史持久化到服务端 JSON，并用于更长时间范围折线图。
+- [x] 可选 WebUI Basic 登录认证：通过 `WEB_USERNAME` / `WEB_PASSWORD` 开启。
+- [x] 为每一次配置操作记录审计日志。
+- [x] 每次写配置前后的 running-config diff。
+- [x] 可选 HTTPS/TLS：通过 `--tls-cert` / `--tls-key` 或环境变量开启。
+- [x] 带二次确认的保存配置动作：`save_config` / `write memory`。
+- [x] VLAN trunk 配置模板。
+- [x] SVI 创建模板。
+- [x] OSPF interface area 配置模板。
+- [x] BGP address-family activate/deactivate 模板。
 
 ### 部分完成 / 需要更多验证
 
@@ -65,20 +78,20 @@ http://交换机IP:2480/
 - [ ] 验证 LLDP 输出中系统名、Chassis ID、端口 ID 包含空格时的解析。
 - [ ] 改进 OSPF、OSPFv3、BGP 的解析，不只依赖 summary 简表。
 - [ ] 改进 VLAN、ARP、FDB 大表分页和前端渲染性能。
-- [ ] 将流量历史持久化到服务端，而不是只保存在浏览器内存中。
-- [ ] 生产使用前增加 WebUI 登录认证。
+- [x] 将流量历史持久化到服务端，而不是只保存在浏览器内存中。
+- [x] 生产使用前增加 WebUI 登录认证。
 - [ ] 增加只读用户和运维用户的权限区分。
-- [ ] 为每一次配置操作增加完整审计日志。
+- [x] 为每一次配置操作增加完整审计日志。
 - [ ] 增加配置操作回滚辅助能力。
 - [ ] 通过 EOS event-handler 或受支持的启动机制实现开机自启。
 - [ ] 在实验环境中完整验证所有受控写操作。
 
 ### 未完成
 
-- [ ] PoE 状态查看和 PoE 控制。
-- [ ] 光模块详情页：基于 `show interfaces transceiver`。
-- [ ] 光功率、DOM 温度、序列号、厂商、阈值告警。
-- [ ] 接口计数器历史存储和更长时间范围的图表。
+- [x] PoE 状态查看和 PoE 控制。
+- [x] 光模块详情页：基于 `show interfaces transceiver`。
+- [x] 光功率、DOM 温度、序列号、厂商、阈值告警。
+- [x] 接口计数器历史存储和更长时间范围的图表。
 - [ ] 可拖拽/可自定义的仪表盘组件。
 - [ ] 多设备自动发现。
 - [ ] 多设备拓扑图。
@@ -86,12 +99,12 @@ http://交换机IP:2480/
 - [ ] NetFlow/sFlow/IPFIX Collector 集成。
 - [ ] 告警通知渠道。
 - [ ] 用户登录和会话管理。
-- [ ] HTTPS/TLS 支持。
-- [ ] 每次写配置前后的 diff。
-- [ ] 带二次确认的保存配置按钮。
-- [ ] VLAN trunk 配置模板。
+- [x] HTTPS/TLS 支持。
+- [x] 每次写配置前后的 diff。
+- [x] 带二次确认的保存配置按钮。
+- [x] VLAN trunk 配置模板。
 - [ ] SVI 创建和网关校验流程。
-- [ ] OSPF area/interface 配置流程。
+- [x] OSPF area/interface 配置流程。
 - [ ] BGP address-family 和 route-policy 配置流程。
 - [ ] 基于 EOS 命令样本的单元测试。
 - [ ] 浏览器 UI 回归测试。

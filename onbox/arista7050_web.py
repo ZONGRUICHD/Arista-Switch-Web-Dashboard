@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import base64
+import difflib
 import json
 import os
 import re
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -11,6 +14,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 MODEL = "Arista DCS-7050QX-32S-F"
+DATA_DIR = os.environ.get("WEB_DATA_DIR", "/mnt/flash")
+HISTORY_FILE = os.environ.get("WEB_HISTORY_FILE", os.path.join(DATA_DIR, "arista7050_web_history.json"))
+AUDIT_FILE = os.environ.get("WEB_AUDIT_FILE", os.path.join(DATA_DIR, "arista7050_web_audit.jsonl"))
 READ_ONLY = re.compile(r"^(show|ping|traceroute|traceroute6|dir|more)\b", re.I)
 BLOCKED = re.compile(r"^(configure|conf|enable|reload|reboot|write|copy|delete|erase|bash|sudo|install)\b", re.I)
 
@@ -19,9 +25,49 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def read_json_file(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return fallback
+
+
+def write_json_file(path, payload):
+    try:
+        directory = os.path.dirname(path)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+        tmp = "%s.tmp" % path
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def append_audit(entry):
+    record = dict(entry)
+    record["time"] = now_ms()
+    try:
+        directory = os.path.dirname(AUDIT_FILE)
+        if directory and not os.path.exists(directory):
+            os.makedirs(directory)
+        with open(AUDIT_FILE, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 def is_safe_command(command):
     command = command.strip()
     return bool(command) and not BLOCKED.search(command) and bool(READ_ONLY.search(command))
+
+
+def auth_credentials():
+    user = os.environ.get("WEB_USERNAME", "").strip()
+    password = os.environ.get("WEB_PASSWORD", "")
+    return user, password
 
 
 def run_cli(command, timeout=22):
@@ -56,6 +102,21 @@ def run_cli(command, timeout=22):
         except subprocess.TimeoutExpired:
             raise TimeoutError("Command timed out.")
 
+    raise RuntimeError(last_error or "No EOS CLI runner found.")
+
+
+def run_eos_script(script, timeout=25):
+    runners = [["/usr/bin/Cli", "-c", script], ["Cli", "-c", script], ["/usr/bin/FastCli", "-p", "15", "-c", script]]
+    last_error = None
+    for cmd in runners:
+        try:
+            result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+            output = ((result.stdout or "") + (result.stderr or "")).strip()
+            if result.returncode == 0:
+                return output or "OK"
+            last_error = output or "command returned %s" % result.returncode
+        except FileNotFoundError as exc:
+            last_error = str(exc)
     raise RuntimeError(last_error or "No EOS CLI runner found.")
 
 
@@ -188,13 +249,15 @@ def parse_interface_errors(output):
     return errors
 
 
-def enrich_ports(ports, rates, errors):
+def enrich_ports(ports, rates, errors, transceivers=None):
+    transceivers = transceivers or {}
     enriched = []
     for port in ports:
         key = port["name"].lower()
         item = dict(port)
         item.update(rates.get(key, {}))
         item.update(errors.get(key, {}))
+        item["transceiver"] = transceivers.get(key, {})
         item["errors"] = int(item.get("errors") or 0)
         enriched.append(item)
     return enriched
@@ -290,6 +353,29 @@ def traffic_summary(ports):
     }
 
 
+def update_history(ports, traffic):
+    history = read_json_file(HISTORY_FILE, {"traffic": [], "ports": {}})
+    if not isinstance(history, dict):
+        history = {"traffic": [], "ports": {}}
+    history.setdefault("traffic", [])
+    history.setdefault("ports", {})
+
+    point = {"time": now_ms(), "rxMbps": traffic.get("rxMbps", 0), "txMbps": traffic.get("txMbps", 0), "totalMbps": traffic.get("totalMbps", 0)}
+    history["traffic"].append(point)
+    history["traffic"] = history["traffic"][-2880:]
+
+    for port in ports:
+        name = port.get("name")
+        if not name:
+            continue
+        series = history["ports"].setdefault(name, [])
+        series.append({"time": point["time"], "rxMbps": port.get("rxMbps", 0), "txMbps": port.get("txMbps", 0), "errors": port.get("errors", 0)})
+        history["ports"][name] = series[-2880:]
+
+    write_json_file(HISTORY_FILE, history)
+    return history
+
+
 def parse_lldp_neighbors(output):
     neighbors = []
     for line in output.splitlines():
@@ -372,6 +458,103 @@ def parse_fdb(output):
     return rows
 
 
+def parse_transceivers(summary_output, detail_output=""):
+    modules = {}
+    for line in summary_output.splitlines():
+        stripped = line.strip()
+        if not stripped or not re.match(r"^(Et|Ethernet)\d+(?:/\d+)?\b", stripped, re.I):
+            continue
+        tokens = stripped.split()
+        name = normalize_interface(tokens[0])
+        raw_tail = " ".join(tokens[1:])
+        present = "not present" not in raw_tail.lower() and "not-present" not in raw_tail.lower()
+        modules[name.lower()] = {
+            "interface": name,
+            "present": present,
+            "type": raw_tail or "-",
+            "vendor": "-",
+            "model": "-",
+            "serial": "-",
+            "temperature": "-",
+            "txPower": "-",
+            "rxPower": "-",
+            "alerts": [],
+            "raw": stripped,
+        }
+
+    current = None
+    for line in detail_output.splitlines():
+        stripped = line.strip()
+        header = re.match(r"^(Et|Ethernet)\d+(?:/\d+)?\b", stripped, re.I)
+        if header:
+            current = normalize_interface(header.group(0)).lower()
+            modules.setdefault(
+                current,
+                {
+                    "interface": normalize_interface(header.group(0)),
+                    "present": True,
+                    "type": "-",
+                    "vendor": "-",
+                    "model": "-",
+                    "serial": "-",
+                    "temperature": "-",
+                    "txPower": "-",
+                    "rxPower": "-",
+                    "alerts": [],
+                    "raw": stripped,
+                },
+            )
+        if not current or current not in modules:
+            continue
+        item = modules[current]
+        lower = stripped.lower()
+        if "not present" in lower:
+            item["present"] = False
+        for key, patterns in {
+            "type": [r"type\s+(?:is\s+)?(.+)$", r"media type\s*:\s*(.+)$"],
+            "vendor": [r"vendor(?: name)?\s+(?:is\s+)?(.+)$", r"vendor(?: name)?\s*:\s*(.+)$"],
+            "model": [r"(?:part|model)(?: number)?\s+(?:is\s+)?(.+)$", r"(?:part|model)(?: number)?\s*:\s*(.+)$"],
+            "serial": [r"serial(?: number)?\s+(?:is\s+)?(.+)$", r"serial(?: number)?\s*:\s*(.+)$"],
+            "temperature": [r"temperature\s*[:=]?\s*([-\d.]+\s*C?)"],
+            "txPower": [r"tx\s+power\s*[:=]?\s*([-\d.]+\s*\w*)", r"transmit\s+power\s*[:=]?\s*([-\d.]+\s*\w*)"],
+            "rxPower": [r"rx\s+power\s*[:=]?\s*([-\d.]+\s*\w*)", r"receive\s+power\s*[:=]?\s*([-\d.]+\s*\w*)"],
+        }.items():
+            for pattern in patterns:
+                match = re.search(pattern, stripped, re.I)
+                if match:
+                    item[key] = match.group(1).strip()
+                    break
+        if any(word in lower for word in ("alarm", "warning", "fault", "high", "low")):
+            item["alerts"].append(stripped)
+
+    return modules
+
+
+def parse_poe(output):
+    rows = []
+    unsupported = not output.strip()
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "invalid input" in stripped.lower() or "not supported" in stripped.lower():
+            unsupported = True
+            continue
+        if not re.match(r"^(Et|Ethernet)\d+(?:/\d+)?\b", stripped, re.I):
+            continue
+        tokens = stripped.split()
+        rows.append(
+            {
+                "interface": normalize_interface(tokens[0]),
+                "admin": next((token for token in tokens if token.lower() in ("auto", "on", "off", "never")), "-"),
+                "state": next((token for token in tokens if token.lower() in ("delivering", "searching", "disabled", "fault", "denied")), "-"),
+                "watts": next((token for token in tokens if re.match(r"^\d+(?:\.\d+)?W?$", token, re.I)), "-"),
+                "raw": stripped,
+            }
+        )
+    return {"supported": bool(rows) and not unsupported, "ports": rows, "raw": output}
+
+
 def parse_protocol_rows(output, kind):
     rows = []
     for line in output.splitlines():
@@ -412,6 +595,9 @@ def build_alerts(ports, health, env_output, command_errors):
             alerts.append({"severity": "warning", "title": "介质存在但链路未 Up", "message": "%s / %s" % (port.get("label"), port.get("media"))})
         if int(port.get("errors") or 0) > 0:
             alerts.append({"severity": "warning", "title": "接口错误计数", "message": "%s errors=%s" % (port.get("label"), port.get("errors"))})
+        optic = port.get("transceiver") or {}
+        if optic.get("alerts"):
+            alerts.append({"severity": "warning", "title": "光模块告警", "message": "%s / %s" % (port.get("label"), "; ".join(optic.get("alerts")[:2]))})
     if "fail" in env_output.lower() or "fault" in env_output.lower():
         alerts.append({"severity": "critical", "title": "环境告警", "message": "show environment all 中包含 fail/fault。"})
     return alerts[:100]
@@ -438,6 +624,31 @@ def safe_vlan(value):
     return str(number)
 
 
+def safe_vlan_list(value):
+    text = str(value or "").strip()
+    if not re.match(r"^[\d,\- ]+$", text):
+        raise ValueError("Expected VLAN list like 10,20,30-40.")
+    for part in re.split(r"[, ]+", text):
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            if int(start) > int(end):
+                raise ValueError("Invalid VLAN range.")
+            safe_vlan(start)
+            safe_vlan(end)
+        else:
+            safe_vlan(part)
+    return text.replace(" ", "")
+
+
+def safe_ipv4(value):
+    value = str(value or "").strip()
+    if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", value):
+        raise ValueError("Expected IPv4 address.")
+    return value
+
+
 def safe_ip_prefix(value):
     value = str(value or "").strip()
     if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$", value):
@@ -453,15 +664,33 @@ def build_config_action(action, params):
         if state not in ("enable", "disable"):
             raise ValueError("state must be enable or disable.")
         return ["interface %s" % iface, "no shutdown" if state == "enable" else "shutdown"]
+    if action == "poe_control":
+        iface = safe_interface(params.get("interface"))
+        state = str(params.get("state") or "").lower()
+        if state not in ("enable", "disable"):
+            raise ValueError("state must be enable or disable.")
+        return ["interface %s" % iface, "poe enable" if state == "enable" else "poe disable"]
     if action == "description":
         return ["interface %s" % safe_interface(params.get("interface")), "description %s" % safe_text(params.get("description"))]
     if action == "access_vlan":
         return ["interface %s" % safe_interface(params.get("interface")), "switchport mode access", "switchport access vlan %s" % safe_vlan(params.get("vlan"))]
+    if action == "trunk_vlan":
+        commands = ["interface %s" % safe_interface(params.get("interface")), "switchport mode trunk", "switchport trunk allowed vlan %s" % safe_vlan_list(params.get("vlan"))]
+        native_vlan = str(params.get("nativeVlan") or "").strip()
+        if native_vlan:
+            commands.append("switchport trunk native vlan %s" % safe_vlan(native_vlan))
+        return commands
     if action == "create_vlan":
         commands = ["vlan %s" % safe_vlan(params.get("vlan"))]
         name = str(params.get("name") or "").strip()
         if name:
             commands.append("name %s" % safe_text(name))
+        return commands
+    if action == "svi_interface":
+        commands = ["interface Vlan%s" % safe_vlan(params.get("vlan")), "ip address %s" % safe_ip_prefix(params.get("address"))]
+        name = str(params.get("description") or "").strip()
+        if name:
+            commands.append("description %s" % safe_text(name))
         return commands
     if action == "l3_interface":
         return ["interface %s" % safe_interface(params.get("interface")), "no switchport", "ip address %s" % safe_ip_prefix(params.get("address"))]
@@ -470,28 +699,45 @@ def build_config_action(action, params):
         network = safe_ip_prefix(params.get("network"))
         area = safe_text(params.get("area") or "0", r"^[\d.]{1,15}$")
         return ["router ospf %s" % process, "network %s area %s" % (network, area)]
+    if action == "ospf_interface":
+        area = safe_text(params.get("area") or "0", r"^[\d.]{1,15}$")
+        return ["interface %s" % safe_interface(params.get("interface")), "ip ospf area %s" % area]
     if action == "bgp_neighbor":
         asn = safe_text(params.get("asn"), r"^\d{1,10}$")
-        peer = safe_text(params.get("neighbor"), r"^\d{1,3}(?:\.\d{1,3}){3}$")
+        peer = safe_ipv4(params.get("neighbor"))
         remote_as = safe_text(params.get("remoteAs"), r"^\d{1,10}$")
         return ["router bgp %s" % asn, "neighbor %s remote-as %s" % (peer, remote_as)]
+    if action == "bgp_address_family":
+        asn = safe_text(params.get("asn"), r"^\d{1,10}$")
+        peer = safe_ipv4(params.get("neighbor"))
+        family = safe_text(params.get("addressFamily") or "ipv4", r"^(ipv4|ipv6)$")
+        mode = safe_text(params.get("mode") or "activate", r"^(activate|deactivate)$")
+        command = "neighbor %s activate" % peer if mode == "activate" else "no neighbor %s activate" % peer
+        return ["router bgp %s" % asn, "address-family %s" % family, command]
+    if action == "save_config":
+        return ["write memory"]
     raise ValueError("Unsupported config action.")
 
 
 def run_config_commands(commands):
+    if commands == ["write memory"]:
+        return run_eos_script("write memory", timeout=45)
     script = "configure terminal\n%s\nend" % "\n".join(commands)
-    runners = [["/usr/bin/Cli", "-c", script], ["Cli", "-c", script], ["/usr/bin/FastCli", "-p", "15", "-c", script]]
-    last_error = None
-    for cmd in runners:
-        try:
-            result = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=False)
-            output = ((result.stdout or "") + (result.stderr or "")).strip()
-            if result.returncode == 0:
-                return output or "Configuration applied."
-            last_error = output or "command returned %s" % result.returncode
-        except FileNotFoundError as exc:
-            last_error = str(exc)
-    raise RuntimeError(last_error or "No EOS CLI runner found.")
+    return run_eos_script(script, timeout=25) or "Configuration applied."
+
+
+def config_diff(before, after):
+    if before == after:
+        return ""
+    return "\n".join(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile="before-running-config",
+            tofile="after-running-config",
+            lineterm="",
+        )
+    )
 
 
 def collect_state():
@@ -504,12 +750,21 @@ def collect_state():
             errors.append("%s: %s" % (command, exc))
             return ""
 
+    def get_optional(command):
+        try:
+            return run_cli(command)
+        except Exception:
+            return ""
+
     version_output = get("show version")
     hostname_output = get("show hostname")
     uptime_output = get("show uptime")
     interface_output = get("show interfaces status")
     rates_output = get("show interfaces counters rates")
     errors_output = get("show interfaces counters errors")
+    transceiver_output = get("show interfaces transceiver")
+    transceiver_detail_output = get("show interfaces transceiver detail")
+    poe_output = get_optional("show poe interface")
     top_output = get("show processes top once")
     env_output = get("show environment all")
     lldp_output = get("show lldp neighbors")
@@ -522,8 +777,10 @@ def collect_state():
     integration_output = get("show running-config | include logging host|sflow|netflow|ip flow|flow exporter|flow monitor")
 
     eos_version, serial = parse_version(version_output)
-    ports = enrich_ports(parse_interfaces(interface_output), parse_interface_rates(rates_output), parse_interface_errors(errors_output))
+    transceivers = parse_transceivers(transceiver_output, transceiver_detail_output)
+    ports = enrich_ports(parse_interfaces(interface_output), parse_interface_rates(rates_output), parse_interface_errors(errors_output), transceivers)
     traffic = traffic_summary(ports)
+    history = update_history(ports, traffic)
     health = parse_system_health(top_output, env_output, version_output)
     alerts = build_alerts(ports, health, env_output, errors)
     return {
@@ -541,7 +798,10 @@ def collect_state():
         },
         "health": health,
         "traffic": traffic,
+        "history": history,
         "ports": ports,
+        "transceivers": list(transceivers.values()),
+        "poe": parse_poe(poe_output),
         "lldp": parse_lldp_neighbors(lldp_output),
         "vlans": parse_vlans(vlan_output),
         "arp": parse_arp(arp_output),
@@ -595,21 +855,23 @@ INDEX_HTML = r"""<!doctype html>
     <section class="wide-grid dashboard-section"><div class="panel"><div class="panel-title"><h2>设备告警</h2><span class="muted">自动发现</span></div><ul id="alertList" class="alert-list"></ul></div><div class="panel"><div class="panel-title"><h2>基础拓扑 / LLDP</h2><span class="muted">邻居</span></div><ul id="lldpList" class="topology-list"></ul></div></section>
     <section class="wide-grid dashboard-section"><div class="panel"><div class="panel-title"><h2>协议状态</h2><span class="muted">OSPF / OSPFv3 / BGP</span></div><div class="table-wrap"><table id="protocolTable" class="data-table"></table></div></div><div class="panel"><div class="panel-title"><h2>VLAN / ARP / FDB</h2><span class="muted">采集表</span></div><div class="table-wrap"><table id="tablesView" class="data-table"></table></div></div></section>
     <section class="wide-grid dashboard-section"><div class="panel"><div class="panel-title"><h2>Syslog / Flow 集成</h2><span class="muted">配置探测</span></div><div id="integrationView" class="mini-status"></div></div><div class="panel"><div class="panel-title"><h2>流量图</h2><span id="chartLabel" class="muted">实时汇总</span></div><canvas id="trafficChart2" class="chart" width="700" height="120"></canvas></div></section>
-    <section class="panel dashboard-section" style="margin-top:16px"><div class="panel-title"><h2>受控配置</h2><span class="muted">需要输入 APPLY</span></div><form id="opsForm" class="ops-form"><label><span>动作</span><select id="opsAction"><option value="interface_admin">端口启停</option><option value="description">改接口描述</option><option value="create_vlan">创建 VLAN</option><option value="access_vlan">接口加入 VLAN</option><option value="l3_interface">配置三层接口</option><option value="ospf_network">OSPF network</option><option value="bgp_neighbor">BGP neighbor</option></select></label><label><span>接口</span><input id="opsInterface" placeholder="Ethernet3" /></label><label><span>状态</span><select id="opsState"><option value="enable">enable</option><option value="disable">disable</option></select></label><label><span>VLAN</span><input id="opsVlan" placeholder="10" /></label><label><span>描述 / 名称</span><input id="opsText" placeholder="server-uplink" /></label><label><span>IP/前缀</span><input id="opsAddress" placeholder="192.168.10.1/24" /></label><label><span>进程/本端 AS</span><input id="opsProcess" placeholder="1 或 65000" /></label><label><span>Area / 邻居 AS</span><input id="opsArea" placeholder="0 或 65001" /></label><label><span>BGP 邻居</span><input id="opsNeighbor" placeholder="192.168.10.2" /></label><label><span>确认</span><input id="opsConfirm" placeholder="APPLY" /></label><button id="opsPreview" class="ghost" type="button">预览</button><button class="primary" type="submit">执行</button><pre id="opsOutput" class="full">等待操作...</pre></form></section>
+    <section class="panel dashboard-section" style="margin-top:16px"><div class="panel-title"><h2>光模块</h2><span class="muted">Transceiver / DOM</span></div><div class="table-wrap"><table id="transceiverTable" class="data-table"></table></div></section>
+    <section class="panel dashboard-section" style="margin-top:16px"><div class="panel-title"><h2>PoE</h2><span class="muted">支持机型自动显示</span></div><div class="table-wrap"><table id="poeTable" class="data-table"></table></div></section>
+    <section class="panel dashboard-section" style="margin-top:16px"><div class="panel-title"><h2>受控配置</h2><span class="muted">需要输入 APPLY</span></div><form id="opsForm" class="ops-form"><label><span>动作</span><select id="opsAction"><option value="interface_admin">端口启停</option><option value="poe_control">PoE 启停</option><option value="description">改接口描述</option><option value="create_vlan">创建 VLAN</option><option value="access_vlan">接口加入 VLAN</option><option value="trunk_vlan">VLAN trunk</option><option value="svi_interface">创建 SVI</option><option value="l3_interface">配置三层接口</option><option value="ospf_network">OSPF network</option><option value="ospf_interface">OSPF interface</option><option value="bgp_neighbor">BGP neighbor</option><option value="bgp_address_family">BGP address-family</option><option value="save_config">保存配置</option></select></label><label><span>接口</span><input id="opsInterface" placeholder="Ethernet3" /></label><label><span>状态</span><select id="opsState"><option value="enable">enable</option><option value="disable">disable</option><option value="activate">activate</option><option value="deactivate">deactivate</option></select></label><label><span>VLAN</span><input id="opsVlan" placeholder="10 或 10,20,30-40" /></label><label><span>描述 / 名称 / 原生 VLAN</span><input id="opsText" placeholder="server-uplink" /></label><label><span>IP/前缀</span><input id="opsAddress" placeholder="192.168.10.1/24" /></label><label><span>进程/本端 AS</span><input id="opsProcess" placeholder="1 或 65000" /></label><label><span>Area / 邻居 AS</span><input id="opsArea" placeholder="0 或 65001" /></label><label><span>BGP 邻居</span><input id="opsNeighbor" placeholder="192.168.10.2" /></label><label><span>确认</span><input id="opsConfirm" placeholder="APPLY" /></label><button id="opsPreview" class="ghost" type="button">预览</button><button class="primary" type="submit">执行</button><pre id="opsOutput" class="full">等待操作...</pre></form></section>
     <section id="portsPage" class="ports-page"><div class="panel"><div class="panel-title"><div><h2>端口视图</h2><p id="portsPageSummary" class="muted">-</p></div><div class="legend"><span><i class="dot up"></i>Up</span><span><i class="dot down"></i>Down</span><span><i class="dot media"></i>Media</span><span><i class="dot warn"></i>Error</span></div></div><div id="portGrid" class="port-grid"></div></div></section>
   </main>
   <div id="portModal" class="modal"><div class="dialog"><div class="dialog-head"><h2 id="modalTitle">端口详情</h2><button id="modalClose" class="ghost">关闭</button></div><div id="modalBody" class="dialog-body"></div></div></div>
   <div id="toast" class="toast"></div>
   <script>
-    const $=s=>document.querySelector(s),el={refreshBtn:$("#refreshBtn"),themeBtn:$("#themeBtn"),dashboardNav:$("#dashboardNav"),portsNav:$("#portsNav"),openPortsBtn:$("#openPortsBtn"),hostname:$("#hostname"),eosVersion:$("#eosVersion"),forwardingLive:$("#forwardingLive"),switchingLive:$("#switchingLive"),trafficSubline:$("#trafficSubline"),capacitySubline:$("#capacitySubline"),portSummary:$("#portSummary"),portsPageSummary:$("#portsPageSummary"),portsPage:$("#portsPage"),lastRefresh:$("#lastRefresh"),cpuMeter:$("#cpuMeter"),cpuValue:$("#cpuValue"),memoryMeter:$("#memoryMeter"),memoryValue:$("#memoryValue"),temperatureMeter:$("#temperatureMeter"),temperatureValue:$("#temperatureValue"),fanStatus:$("#fanStatus"),psuStatus:$("#psuStatus"),portGrid:$("#portGrid"),commandForm:$("#commandForm"),commandInput:$("#commandInput"),commandOutput:$("#commandOutput"),eventList:$("#eventList"),alertList:$("#alertList"),lldpList:$("#lldpList"),protocolTable:$("#protocolTable"),tablesView:$("#tablesView"),integrationView:$("#integrationView"),trafficChart:$("#trafficChart"),trafficChart2:$("#trafficChart2"),chartLabel:$("#chartLabel"),opsForm:$("#opsForm"),opsAction:$("#opsAction"),opsInterface:$("#opsInterface"),opsState:$("#opsState"),opsVlan:$("#opsVlan"),opsText:$("#opsText"),opsAddress:$("#opsAddress"),opsProcess:$("#opsProcess"),opsArea:$("#opsArea"),opsNeighbor:$("#opsNeighbor"),opsConfirm:$("#opsConfirm"),opsPreview:$("#opsPreview"),opsOutput:$("#opsOutput"),toast:$("#toast"),portModal:$("#portModal"),modalTitle:$("#modalTitle"),modalBody:$("#modalBody"),modalClose:$("#modalClose")};
+    const $=s=>document.querySelector(s),el={refreshBtn:$("#refreshBtn"),themeBtn:$("#themeBtn"),dashboardNav:$("#dashboardNav"),portsNav:$("#portsNav"),openPortsBtn:$("#openPortsBtn"),hostname:$("#hostname"),eosVersion:$("#eosVersion"),forwardingLive:$("#forwardingLive"),switchingLive:$("#switchingLive"),trafficSubline:$("#trafficSubline"),capacitySubline:$("#capacitySubline"),portSummary:$("#portSummary"),portsPageSummary:$("#portsPageSummary"),portsPage:$("#portsPage"),lastRefresh:$("#lastRefresh"),cpuMeter:$("#cpuMeter"),cpuValue:$("#cpuValue"),memoryMeter:$("#memoryMeter"),memoryValue:$("#memoryValue"),temperatureMeter:$("#temperatureMeter"),temperatureValue:$("#temperatureValue"),fanStatus:$("#fanStatus"),psuStatus:$("#psuStatus"),portGrid:$("#portGrid"),commandForm:$("#commandForm"),commandInput:$("#commandInput"),commandOutput:$("#commandOutput"),eventList:$("#eventList"),alertList:$("#alertList"),lldpList:$("#lldpList"),protocolTable:$("#protocolTable"),tablesView:$("#tablesView"),transceiverTable:$("#transceiverTable"),poeTable:$("#poeTable"),integrationView:$("#integrationView"),trafficChart:$("#trafficChart"),trafficChart2:$("#trafficChart2"),chartLabel:$("#chartLabel"),opsForm:$("#opsForm"),opsAction:$("#opsAction"),opsInterface:$("#opsInterface"),opsState:$("#opsState"),opsVlan:$("#opsVlan"),opsText:$("#opsText"),opsAddress:$("#opsAddress"),opsProcess:$("#opsProcess"),opsArea:$("#opsArea"),opsNeighbor:$("#opsNeighbor"),opsConfirm:$("#opsConfirm"),opsPreview:$("#opsPreview"),opsOutput:$("#opsOutput"),toast:$("#toast"),portModal:$("#portModal"),modalTitle:$("#modalTitle"),modalBody:$("#modalBody"),modalClose:$("#modalClose")};
     let toastTimer=null,currentPorts=[],activePortIndex=null;const portHistory={};function esc(v){return String(v??"-").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}function toast(m){el.toast.textContent=m;el.toast.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.toast.classList.remove("show"),2600)}function fmt(v){return v?new Intl.DateTimeFormat("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}).format(new Date(v)):"-"}async function req(u,o={}){const r=await fetch(u,{headers:{"Content-Type":"application/json"},...o});const p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||`HTTP ${r.status}`);return p}function pct(v){return Number.isFinite(Number(v))?`${Number(v).toFixed(0)}%`:"-"}function mbps(v){return `${Number(v||0).toFixed(2)}M`}
     function setTheme(theme){document.body.dataset.theme=theme;localStorage.setItem("theme",theme);el.themeBtn.textContent=theme==="dark"?"浅色":"深色"}setTheme(localStorage.getItem("theme")||"light");function showPage(page){const ports=page==="ports";document.querySelectorAll(".dashboard-section").forEach(x=>x.classList.toggle("hidden",ports));el.portsPage.classList.toggle("active",ports);el.dashboardNav.classList.toggle("active",!ports);el.portsNav.classList.toggle("active",ports);history.replaceState(null,"",ports?"/ports":"/")} 
-    function detail(label,value){return `<div class="detail-item"><span>${label}</span><b>${esc(value)}</b></div>`}function showPort(i){const p=currentPorts[i];if(!p)return;activePortIndex=i;el.modalTitle.textContent=`${p.label||p.name} 端口详情`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("状态",p.status)}${detail("VLAN",p.vlan)}${detail("双工",p.duplex)}${detail("协商/网速",p.speed)}${detail("介质",p.media)}${detail("RX Mbps",Number(p.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(p.txMbps||0).toFixed(2))}${detail("RX Kpps",Number(p.rxKpps||0).toFixed(2))}${detail("TX Kpps",Number(p.txKpps||0).toFixed(2))}${detail("错误计数",p.errors||0)}${detail("描述",p.description||"-")}</div><canvas id="portLineChart" class="port-chart" width="760" height="180"></canvas><pre>${esc([p.statusLine,p.rateLine,p.errorLine].filter(Boolean).join("\n"))}</pre>`;el.portModal.classList.add("show");setTimeout(()=>drawPortChart(p.name),0)}
+    function detail(label,value){return `<div class="detail-item"><span>${label}</span><b>${esc(value)}</b></div>`}function showPort(i){const p=currentPorts[i];if(!p)return;const o=p.transceiver||{};activePortIndex=i;el.modalTitle.textContent=`${p.label||p.name} 端口详情`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("状态",p.status)}${detail("VLAN",p.vlan)}${detail("双工",p.duplex)}${detail("协商/网速",p.speed)}${detail("介质",p.media)}${detail("RX Mbps",Number(p.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(p.txMbps||0).toFixed(2))}${detail("RX Kpps",Number(p.rxKpps||0).toFixed(2))}${detail("TX Kpps",Number(p.txKpps||0).toFixed(2))}${detail("错误计数",p.errors||0)}${detail("描述",p.description||"-")}${detail("光模块",o.present===false?"Not Present":(o.type||"-"))}${detail("厂商",o.vendor||"-")}${detail("序列号",o.serial||"-")}${detail("DOM 温度",o.temperature||"-")}${detail("TX/RX 光功率",`${o.txPower||"-"} / ${o.rxPower||"-"}`)}</div><canvas id="portLineChart" class="port-chart" width="760" height="180"></canvas><pre>${esc([p.statusLine,p.rateLine,p.errorLine,o.raw,(o.alerts||[]).join("\n")].filter(Boolean).join("\n"))}</pre>`;el.portModal.classList.add("show");setTimeout(()=>drawPortChart(p.name),0)}
     const historyData=[];function drawSingleChart(c,values,color){if(!c)return;const ctx=c.getContext("2d"),w=c.width,h=c.height,max=Math.max(1,...values);ctx.clearRect(0,0,w,h);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=20;y<h;y+=25){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();values.forEach((v,i)=>{const x=i*(w/Math.max(1,values.length-1)),y=h-12-(v/max)*(h-24);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}function drawChart(t){historyData.push(Number(t.totalMbps||0));while(historyData.length>40)historyData.shift();drawSingleChart(el.trafficChart,historyData,"#0f766e");drawSingleChart(el.trafficChart2,historyData,"#0f766e");el.chartLabel.textContent=`${Number(t.totalMbps||0).toFixed(2)} Mbps / ${Number(t.totalKpps||0).toFixed(2)} Kpps`}function drawPortChart(name){const c=$("#portLineChart"),h=portHistory[name]||[];if(!c||!h.length)return;const rx=h.map(x=>x.rx),tx=h.map(x=>x.tx),ctx=c.getContext("2d"),w=c.width,ht=c.height,max=Math.max(1,...rx,...tx);ctx.clearRect(0,0,w,ht);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=24;y<ht;y+=34){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();function line(vals,color){ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();vals.forEach((v,i)=>{const x=i*(w/Math.max(1,vals.length-1)),y=ht-18-(v/max)*(ht-36);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}line(rx,"#2563eb");line(tx,"#0f766e");ctx.fillStyle=getComputedStyle(document.body).getPropertyValue("--muted").trim();ctx.fillText("RX blue / TX green",10,14)}
-    function rows(headers,items,map){return `<thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${map(item).map(v=>`<td>${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>`}function renderExtra(state){const alerts=state.alerts||[];el.alertList.innerHTML=alerts.length?alerts.map(a=>`<li data-severity="${esc(a.severity)}"><b>${esc(a.title)}</b>${esc(a.message)}</li>`).join(""):"<li>暂无告警</li>";el.lldpList.innerHTML=(state.lldp||[]).length?(state.lldp||[]).map(n=>`<li><b>${esc(n.label)}</b> → ${esc(n.neighbor)} / ${esc(n.neighborPort)}</li>`).join(""):"<li>未发现 LLDP 邻居</li>";const proto=[...(state.protocols?.ospf||[]).map(x=>({type:"OSPF",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.ospfv3||[]).map(x=>({type:"OSPFv3",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.bgp||[]).map(x=>({type:"BGP",a:x.peer,b:x.state,c:x.asn}))];el.protocolTable.innerHTML=rows(["协议","对象","状态","接口/AS"],proto,x=>[x.type,x.a,x.b,x.c]);const tableItems=[...(state.vlans||[]).slice(0,40).map(x=>({type:"VLAN",a:x.id,b:x.name,c:x.status,d:x.ports})),...(state.arp||[]).slice(0,40).map(x=>({type:"ARP",a:x.address,b:x.mac,c:x.interface,d:""})),...(state.fdb||[]).slice(0,40).map(x=>({type:"FDB",a:x.vlan,b:x.mac,c:x.type,d:x.port}))];el.tablesView.innerHTML=rows(["类型","键","值","状态","端口"],tableItems,x=>[x.type,x.a,x.b,x.c,x.d]);const i=state.integrations||{};el.integrationView.innerHTML=`<span>Syslog <b>${i.syslog?"ON":"OFF"}</b></span><span>sFlow <b>${i.sflow?"ON":"OFF"}</b></span><span>NetFlow/IPFIX <b>${i.netflow?"ON":"OFF"}</b></span><span>采集 <b>${(state.vlans||[]).length} VLAN / ${(state.arp||[]).length} ARP / ${(state.fdb||[]).length} FDB</b></span>`;drawChart(state.traffic||{})}
-    function render(state){const d=state.device||{},h=state.health||{},t=state.traffic||{},ports=state.ports||[],up=ports.filter(p=>p.status==="up").length,media=ports.filter(p=>p.hasMedia&&p.status!=="up").length,err=ports.filter(p=>Number(p.errors||0)>0).length;currentPorts=ports;ports.forEach(p=>{const k=p.name;(portHistory[k]=portHistory[k]||[]).push({rx:Number(p.rxMbps||0),tx:Number(p.txMbps||0)});while(portHistory[k].length>40)portHistory[k].shift()});el.hostname.textContent=d.hostname||"-";el.eosVersion.textContent=d.eosVersion||"-";el.forwardingLive.textContent=d.forwardingRate||t.packetRateLabel||"-";el.switchingLive.textContent=d.switchingCapacity||t.throughputLabel||"-";el.trafficSubline.textContent=`RX ${mbps(t.rxMbps)} / TX ${mbps(t.txMbps)}`;el.capacitySubline.textContent=`占用 ${Number(t.capacityUtilization||0).toFixed(4)}% of 2.56Tbps`;const summary=`${up}/${ports.length} up, ${media} media, ${err} error`;el.portSummary.textContent=summary;el.portsPageSummary.textContent=summary;el.lastRefresh.textContent=fmt(d.lastRefresh);el.cpuMeter.value=Number(h.cpu||0);el.cpuValue.textContent=pct(h.cpu);el.memoryMeter.value=Number(h.memory||0);el.memoryValue.textContent=pct(h.memory);el.temperatureMeter.value=Number(h.temperature||0);el.temperatureValue.textContent=Number.isFinite(Number(h.temperature))?`${h.temperature}C`:"-";el.fanStatus.textContent=h.fanStatus||"-";el.psuStatus.textContent=h.psuStatus||"-";el.portGrid.innerHTML=ports.map((p,i)=>`<button class="port" data-index="${i}" data-status="${p.status}" data-media="${Boolean(p.hasMedia)}" data-errors="${Number(p.errors||0)>0}"><div class="port-name"><span>${esc(p.label||p.name)}</span><span class="port-speed">${esc(p.speed)}</span></div><div class="port-detail">${esc(p.media)} / VLAN ${esc(p.vlan)}<br>${esc(p.description||p.status)}</div><div class="port-traffic"><span>RX <b>${mbps(p.rxMbps)}</b></span><span>TX <b>${mbps(p.txMbps)}</b></span></div></button>`).join("");if(activePortIndex!==null&&el.portModal.classList.contains("show"))drawPortChart(currentPorts[activePortIndex]?.name);el.eventList.innerHTML=(state.events||[]).map(e=>`<li data-level="${e.level||"info"}"><span class="event-time">${fmt(e.time)} / ${esc(e.level||"info")}</span><span class="event-message">${esc(e.message)}</span></li>`).join("");renderExtra(state)}
+    function rows(headers,items,map){return `<thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${map(item).map(v=>`<td>${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>`}function renderExtra(state){const alerts=state.alerts||[];el.alertList.innerHTML=alerts.length?alerts.map(a=>`<li data-severity="${esc(a.severity)}"><b>${esc(a.title)}</b>${esc(a.message)}</li>`).join(""):"<li>暂无告警</li>";el.lldpList.innerHTML=(state.lldp||[]).length?(state.lldp||[]).map(n=>`<li><b>${esc(n.label)}</b> → ${esc(n.neighbor)} / ${esc(n.neighborPort)}</li>`).join(""):"<li>未发现 LLDP 邻居</li>";const proto=[...(state.protocols?.ospf||[]).map(x=>({type:"OSPF",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.ospfv3||[]).map(x=>({type:"OSPFv3",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.bgp||[]).map(x=>({type:"BGP",a:x.peer,b:x.state,c:x.asn}))];el.protocolTable.innerHTML=rows(["协议","对象","状态","接口/AS"],proto,x=>[x.type,x.a,x.b,x.c]);const tableItems=[...(state.vlans||[]).slice(0,40).map(x=>({type:"VLAN",a:x.id,b:x.name,c:x.status,d:x.ports})),...(state.arp||[]).slice(0,40).map(x=>({type:"ARP",a:x.address,b:x.mac,c:x.interface,d:""})),...(state.fdb||[]).slice(0,40).map(x=>({type:"FDB",a:x.vlan,b:x.mac,c:x.type,d:x.port}))];el.tablesView.innerHTML=rows(["类型","键","值","状态","端口"],tableItems,x=>[x.type,x.a,x.b,x.c,x.d]);const optics=(state.transceivers||[]).filter(x=>x.present!==false).slice(0,96);el.transceiverTable.innerHTML=optics.length?rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],optics,x=>[x.interface,x.type,x.vendor,x.model,x.serial,x.temperature,`${x.txPower||"-"} / ${x.rxPower||"-"}`,(x.alerts||[]).join("; ")]):rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],[],x=>[]);const poe=state.poe||{},poeRows=poe.ports||[];el.poeTable.innerHTML=poeRows.length?rows(["接口","Admin","状态","功率","原始行"],poeRows,x=>[x.interface,x.admin,x.state,x.watts,x.raw]):rows(["接口","Admin","状态","功率","原始行"],[{interface:"-",admin:"-",state:poe.supported===false?"当前机型/系统未返回 PoE 数据":"暂无 PoE 数据",watts:"-",raw:""}],x=>[x.interface,x.admin,x.state,x.watts,x.raw]);const i=state.integrations||{};el.integrationView.innerHTML=`<span>Syslog <b>${i.syslog?"ON":"OFF"}</b></span><span>sFlow <b>${i.sflow?"ON":"OFF"}</b></span><span>NetFlow/IPFIX <b>${i.netflow?"ON":"OFF"}</b></span><span>采集 <b>${(state.vlans||[]).length} VLAN / ${(state.arp||[]).length} ARP / ${(state.fdb||[]).length} FDB</b></span>`;if(state.history?.traffic?.length)historyData.splice(0,historyData.length,...state.history.traffic.slice(-80).map(x=>Number(x.totalMbps||0)));drawChart(state.traffic||{})}
+    function render(state){const d=state.device||{},h=state.health||{},t=state.traffic||{},ports=state.ports||[],up=ports.filter(p=>p.status==="up").length,media=ports.filter(p=>p.hasMedia&&p.status!=="up").length,err=ports.filter(p=>Number(p.errors||0)>0).length;currentPorts=ports;ports.forEach(p=>{const k=p.name;const saved=(state.history?.ports?.[k]||[]).slice(-80).map(x=>({rx:Number(x.rxMbps||0),tx:Number(x.txMbps||0)}));portHistory[k]=saved.length?saved:(portHistory[k]||[]);if(!saved.length)portHistory[k].push({rx:Number(p.rxMbps||0),tx:Number(p.txMbps||0)});while(portHistory[k].length>80)portHistory[k].shift()});el.hostname.textContent=d.hostname||"-";el.eosVersion.textContent=d.eosVersion||"-";el.forwardingLive.textContent=d.forwardingRate||t.packetRateLabel||"-";el.switchingLive.textContent=d.switchingCapacity||t.throughputLabel||"-";el.trafficSubline.textContent=`RX ${mbps(t.rxMbps)} / TX ${mbps(t.txMbps)}`;el.capacitySubline.textContent=`占用 ${Number(t.capacityUtilization||0).toFixed(4)}% of 2.56Tbps`;const summary=`${up}/${ports.length} up, ${media} media, ${err} error`;el.portSummary.textContent=summary;el.portsPageSummary.textContent=summary;el.lastRefresh.textContent=fmt(d.lastRefresh);el.cpuMeter.value=Number(h.cpu||0);el.cpuValue.textContent=pct(h.cpu);el.memoryMeter.value=Number(h.memory||0);el.memoryValue.textContent=pct(h.memory);el.temperatureMeter.value=Number(h.temperature||0);el.temperatureValue.textContent=Number.isFinite(Number(h.temperature))?`${h.temperature}C`:"-";el.fanStatus.textContent=h.fanStatus||"-";el.psuStatus.textContent=h.psuStatus||"-";el.portGrid.innerHTML=ports.map((p,i)=>`<button class="port" data-index="${i}" data-status="${p.status}" data-media="${Boolean(p.hasMedia)}" data-errors="${Number(p.errors||0)>0}"><div class="port-name"><span>${esc(p.label||p.name)}</span><span class="port-speed">${esc(p.speed)}</span></div><div class="port-detail">${esc(p.media)} / VLAN ${esc(p.vlan)}<br>${esc(p.description||p.status)}</div><div class="port-traffic"><span>RX <b>${mbps(p.rxMbps)}</b></span><span>TX <b>${mbps(p.txMbps)}</b></span></div></button>`).join("");if(activePortIndex!==null&&el.portModal.classList.contains("show"))drawPortChart(currentPorts[activePortIndex]?.name);el.eventList.innerHTML=(state.events||[]).map(e=>`<li data-level="${e.level||"info"}"><span class="event-time">${fmt(e.time)} / ${esc(e.level||"info")}</span><span class="event-message">${esc(e.message)}</span></li>`).join("");renderExtra(state)}
     async function load(){const p=await req("/api/state");render(p.state)}async function refresh(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="刷新中";try{const p=await req("/api/refresh",{method:"POST",body:"{}"});render(p.state);toast("已从 EOS CLI 刷新")}catch(e){toast(e.message)}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}
-    function opsPayload(dryRun){return{action:el.opsAction.value,confirm:el.opsConfirm.value,dryRun,params:{interface:el.opsInterface.value,state:el.opsState.value,vlan:el.opsVlan.value,description:el.opsText.value,name:el.opsText.value,address:el.opsAddress.value,network:el.opsAddress.value,process:el.opsProcess.value,asn:el.opsProcess.value,area:el.opsArea.value,remoteAs:el.opsArea.value,neighbor:el.opsNeighbor.value}}}async function runOps(dryRun){el.opsOutput.textContent=dryRun?"生成配置中...":"执行配置中...";try{const p=await req("/api/config",{method:"POST",body:JSON.stringify(opsPayload(dryRun))});el.opsOutput.textContent=(p.commands||[]).join("\n")+(p.output?`\n\n${p.output}`:"");if(!dryRun){toast("配置已提交");refresh()}}catch(err){el.opsOutput.textContent=`ERROR: ${err.message}`}}
+    function opsPayload(dryRun){return{action:el.opsAction.value,confirm:el.opsConfirm.value,dryRun,params:{interface:el.opsInterface.value,state:el.opsState.value,mode:el.opsState.value,vlan:el.opsVlan.value,nativeVlan:el.opsText.value,description:el.opsText.value,name:el.opsText.value,address:el.opsAddress.value,network:el.opsAddress.value,addressFamily:el.opsAddress.value||"ipv4",process:el.opsProcess.value,asn:el.opsProcess.value,area:el.opsArea.value,remoteAs:el.opsArea.value,neighbor:el.opsNeighbor.value}}}async function runOps(dryRun){el.opsOutput.textContent=dryRun?"生成配置中...":"执行配置中...";try{const p=await req("/api/config",{method:"POST",body:JSON.stringify(opsPayload(dryRun))});el.opsOutput.textContent=(p.commands||[]).join("\n")+(p.diff?`\n\nDIFF:\n${p.diff}`:"")+(p.output?`\n\n${p.output}`:"");if(!dryRun){toast("配置已提交");refresh()}}catch(err){el.opsOutput.textContent=`ERROR: ${err.message}`}}
     el.refreshBtn.addEventListener("click",refresh);el.themeBtn.addEventListener("click",()=>setTheme(document.body.dataset.theme==="dark"?"light":"dark"));el.dashboardNav.addEventListener("click",()=>showPage("dashboard"));el.portsNav.addEventListener("click",()=>showPage("ports"));el.openPortsBtn.addEventListener("click",()=>showPage("ports"));el.portGrid.addEventListener("click",e=>{const card=e.target.closest(".port");if(card)showPort(Number(card.dataset.index))});el.modalClose.addEventListener("click",()=>el.portModal.classList.remove("show"));el.portModal.addEventListener("click",e=>{if(e.target===el.portModal)el.portModal.classList.remove("show")});el.opsPreview.addEventListener("click",()=>runOps(true));el.opsForm.addEventListener("submit",e=>{e.preventDefault();runOps(false)});el.commandForm.addEventListener("submit",async e=>{e.preventDefault();const command=el.commandInput.value.trim();if(!command)return;el.commandOutput.textContent=`> ${command}\n运行中...`;try{const p=await req("/api/command",{method:"POST",body:JSON.stringify({command})});el.commandOutput.textContent=`> ${p.command}\n${p.output}`}catch(err){el.commandOutput.textContent=`> ${command}\nERROR: ${err.message}`}});showPage(location.pathname==="/ports"?"ports":"dashboard");load().catch(e=>toast(e.message));setInterval(()=>load().catch(()=>{}),15000);
   </script>
 </body>
@@ -639,7 +901,37 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(size).decode("utf-8") if size else "{}"
         return json.loads(raw or "{}")
 
+    def check_auth(self):
+        user, password = auth_credentials()
+        if not user and not password:
+            return True
+        header = self.headers.get("Authorization", "")
+        if not header.lower().startswith("basic "):
+            self.send_auth_required()
+            return False
+        try:
+            decoded = base64.b64decode(header.split(None, 1)[1]).decode("utf-8")
+            supplied_user, supplied_password = decoded.split(":", 1)
+        except Exception:
+            self.send_auth_required()
+            return False
+        if supplied_user == user and supplied_password == password:
+            return True
+        self.send_auth_required()
+        return False
+
+    def send_auth_required(self):
+        body = b'{"ok":false,"error":"Authentication required"}'
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Arista WebUI"')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        if not self.check_auth():
+            return
         path = urlparse(self.path).path
         if path in ("/", "/ports"):
             body = INDEX_HTML.encode("utf-8")
@@ -660,6 +952,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self):
+        if not self.check_auth():
+            return
         path = urlparse(self.path).path
         try:
             if path == "/api/refresh":
@@ -684,9 +978,24 @@ class Handler(BaseHTTPRequestHandler):
                 if payload.get("dryRun"):
                     self.send_json(200, {"ok": True, "dryRun": True, "commands": commands})
                     return
+                before = ""
+                if commands != ["write memory"]:
+                    try:
+                        before = run_cli("show running-config")
+                    except Exception:
+                        before = ""
                 output = run_config_commands(commands)
+                after = ""
+                diff = ""
+                if commands != ["write memory"]:
+                    try:
+                        after = run_cli("show running-config")
+                        diff = config_diff(before, after) if before else ""
+                    except Exception:
+                        diff = ""
+                append_audit({"client": self.client_address[0], "action": action, "commands": commands, "diff": diff})
                 Handler.cached_state = None
-                self.send_json(200, {"ok": True, "action": action, "commands": commands, "output": output})
+                self.send_json(200, {"ok": True, "action": action, "commands": commands, "diff": diff, "output": output})
                 return
 
             self.send_json(404, {"ok": False, "error": "Not found"})
@@ -700,6 +1009,8 @@ def main():
     parser.add_argument("--port", type=int, default=int(os.environ.get("WEB_PORT", "2480")))
     parser.add_argument("--daemon", action="store_true", help="Run in the background on EOS.")
     parser.add_argument("--log", default="/mnt/flash/arista7050_web.log")
+    parser.add_argument("--tls-cert", default=os.environ.get("WEB_TLS_CERT", ""))
+    parser.add_argument("--tls-key", default=os.environ.get("WEB_TLS_KEY", ""))
     args = parser.parse_args()
 
     if args.daemon:
@@ -717,8 +1028,14 @@ def main():
         os.dup2(log.fileno(), sys.stderr.fileno())
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print("Arista 7050QX on-box web console listening on http://%s:%s" % (args.host, args.port))
-    print("Open http://<switch-management-ip>:%s/" % args.port)
+    scheme = "http"
+    if args.tls_cert and args.tls_key:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        scheme = "https"
+    print("Arista 7050QX on-box web console listening on %s://%s:%s" % (scheme, args.host, args.port))
+    print("Open %s://<switch-management-ip>:%s/" % (scheme, args.port))
     server.serve_forever()
 
 
