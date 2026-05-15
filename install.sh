@@ -67,7 +67,7 @@ if [ -f "$APP_PATH" ]; then
 fi
 
 download "$APP_URL" "$tmp"
-chmod 755 "$tmp"
+chmod 755 "$tmp" 2>/dev/null || echo "Warning: chmod failed on $tmp; continuing because the app is run via $PYTHON." >&2
 "$PYTHON" -m py_compile "$tmp"
 mv "$tmp" "$APP_PATH"
 
