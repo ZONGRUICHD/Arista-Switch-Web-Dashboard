@@ -4,6 +4,7 @@ import base64
 import csv
 import difflib
 import io
+import ipaddress
 import json
 import os
 import re
@@ -333,7 +334,6 @@ def parse_interface_rates_json(data):
             "txMbps": round(out_bps / 1000000.0, 4),
             "rxKpps": round(in_pps / 1000.0, 4),
             "txKpps": round(out_pps / 1000.0, 4),
-            "rateLine": "eAPI rates",
         }
     return rates
 
@@ -345,7 +345,7 @@ def parse_interface_errors_json(data):
         for value in item.values():
             if isinstance(value, (int, float)):
                 total += int(value)
-        errors[normalize_interface(name).lower()] = {"errors": total, "errorLine": "eAPI errors"}
+        errors[normalize_interface(name).lower()] = {"errors": total}
     return errors
 
 
@@ -722,7 +722,7 @@ def parse_environment(output):
             status = " ".join(tokens[6:])
             status = re.sub(r"\s+\d+:\d+:\d+$", "", status).strip().lower()
             if status and not re.search(r"\b(not present|not inserted|absent|empty)\b", status):
-                psu_statuses.append(status)
+                psu_statuses.append(status if status == "ok" else "PSU%s %s" % (tokens[0], status))
     psu_ok = any(status == "ok" for status in psu_statuses)
     psu_fault = any(re.search(r"\b(fail|fault|bad|error|overheat|power loss|offline)\b", status) for status in psu_statuses)
     psu_redundancy_lost = len(psu_statuses) > 1 and any(status != "ok" for status in psu_statuses)
@@ -734,6 +734,7 @@ def parse_environment(output):
         "temperature": temperature,
         "fanStatus": fan_status,
         "psuStatus": psu_status,
+        "psuDetails": psu_statuses,
     }
 
 
@@ -1326,7 +1327,9 @@ def build_alerts(ports, health, env_output, command_errors):
     if health.get("fanStatus") != "OK":
         alerts.append({"severity": "critical", "title": "风扇状态异常", "message": "请检查 show environment all。"})
     if health.get("psuStatus") != "OK":
-        alerts.append({"severity": "critical", "title": "电源状态异常", "message": "请检查 PSU 状态。"})
+        details = [str(item) for item in health.get("psuDetails") or [] if str(item) != "ok"]
+        message = "；".join(details) if details else "请检查 PSU 状态。"
+        alerts.append({"severity": "critical", "title": "电源状态异常", "message": message})
     if int(health.get("temperature") or 0) >= 55:
         alerts.append({"severity": "warning", "title": "温度偏高", "message": "%sC" % health.get("temperature")})
     for port in ports:
@@ -1392,6 +1395,21 @@ def safe_ip_prefix(value):
     value = str(value or "").strip()
     if not re.match(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$", value):
         raise ValueError("Expected IPv4 prefix like 192.168.1.1/24.")
+    try:
+        ipaddress.ip_interface(value)
+    except ValueError:
+        raise ValueError("Expected valid IPv4 prefix like 192.168.1.1/24.")
+    return value
+
+
+def safe_svi_ip_prefix(value):
+    value = safe_ip_prefix(value)
+    interface = ipaddress.ip_interface(value)
+    network = interface.network
+    if network.version != 4:
+        raise ValueError("Expected IPv4 prefix.")
+    if network.prefixlen < 31 and interface.ip in (network.network_address, network.broadcast_address):
+        raise ValueError("SVI address cannot be the network or broadcast address.")
     return value
 
 
@@ -1426,7 +1444,7 @@ def build_config_action(action, params):
             commands.append("name %s" % safe_text(name))
         return commands
     if action == "svi_interface":
-        commands = ["interface Vlan%s" % safe_vlan(params.get("vlan")), "ip address %s" % safe_ip_prefix(params.get("address"))]
+        commands = ["interface Vlan%s" % safe_vlan(params.get("vlan")), "ip address %s" % safe_svi_ip_prefix(params.get("address"))]
         name = str(params.get("description") or "").strip()
         if name:
             commands.append("description %s" % safe_text(name))
@@ -1686,41 +1704,29 @@ def collect_state(scope="full"):
             "show hostname",
             "show uptime",
             "show interfaces status",
-            "show interfaces counters rates",
-            "show interfaces counters errors",
-            "show processes top once",
-            "show lldp neighbors detail",
         ]
         data = jsons(commands)
         version_data = data.get("show version") or {}
         hostname_data = data.get("show hostname") or {}
         uptime_data = data.get("show uptime") or {}
         interface_data = data.get("show interfaces status") or {}
-        rates_data = data.get("show interfaces counters rates") or {}
-        errors_data = data.get("show interfaces counters errors") or {}
-        top_data = data.get("show processes top once") or {}
-        lldp_data = data.get("show lldp neighbors detail") or {}
 
         version_output = "" if has_data(version_data) else get("show version")
         hostname_output = "" if has_data(hostname_data) else get("show hostname")
         uptime_output = "" if has_data(uptime_data) else get("show uptime")
         interface_output = "" if has_data(interface_data) else get("show interfaces status")
-        rates_output = "" if has_data(rates_data) else get("show interfaces counters rates")
-        errors_output = "" if has_data(errors_data) else get("show interfaces counters errors")
-        top_output = "" if has_data(top_data) else get("show processes top once")
-        env_output = get_optional("show system environment all") or get_optional("show environment all")
-        lldp_output = "" if has_data(lldp_data) else get_optional("show lldp neighbors")
+        env_output = ""
 
         eos_version, serial = parse_version_json(version_data) if has_data(version_data) else parse_version(version_output)
         ports = enrich_ports(
             parse_interfaces_json(interface_data) if has_data(interface_data) else parse_interfaces(interface_output),
-            parse_interface_rates_json(rates_data) if has_data(rates_data) else parse_interface_rates(rates_output),
-            parse_interface_errors_json(errors_data) if has_data(errors_data) else parse_interface_errors(errors_output),
+            {},
+            {},
             {},
         )
         traffic = traffic_summary(ports)
-        history = update_history(ports, traffic)
-        health = parse_system_health_json(top_data, env_output, version_data) if has_data(top_data) else parse_system_health(top_output, env_output, version_output)
+        history = read_json_file(HISTORY_FILE, {"traffic": [], "ports": {}})
+        health = parse_system_health("", env_output, version_output)
         alerts = build_alerts(ports, health, env_output, errors)
         uptime = format_duration(uptime_data.get("upTime") or version_data.get("uptime")) if has_data(uptime_data) or has_data(version_data) else (uptime_output.strip() or "-")
         hostname = (hostname_data.get("hostname") or hostname_data.get("fqdn")) if has_data(hostname_data) else parse_hostname(hostname_output)
@@ -1741,10 +1747,63 @@ def collect_state(scope="full"):
             "traffic": traffic,
             "history": compact_history(history, limit=40, include_ports=False),
             "ports": ports,
-            "lldp": parse_lldp_json(lldp_data) if has_data(lldp_data) else parse_lldp_neighbors(lldp_output),
+            "lldp": [],
             "alerts": alerts,
             "events": [{"time": now_ms(), "level": "error" if errors else "info", "message": "; ".join(errors[:4]) if errors else "Core state refreshed via eAPI."}],
-            "loading": {"core": "done", "tables": "pending", "optics": "pending", "protocols": "pending", "extras": "pending"},
+            "loading": {"core": "done", "metrics": "pending", "health": "pending", "tables": "pending", "discovery": "pending", "optics": "pending", "protocols": "pending", "extras": "pending"},
+        }
+
+    if scope == "metrics":
+        commands = ["show interfaces status", "show interfaces counters rates", "show interfaces counters errors", "show processes top once", "show version"]
+        data = jsons(commands)
+        interface_data = data.get("show interfaces status") or {}
+        rates_data = data.get("show interfaces counters rates") or {}
+        errors_data = data.get("show interfaces counters errors") or {}
+        top_data = data.get("show processes top once") or {}
+        version_data = data.get("show version") or {}
+        interface_output = "" if has_data(interface_data) else get("show interfaces status")
+        rates_output = "" if has_data(rates_data) else get("show interfaces counters rates")
+        errors_output = "" if has_data(errors_data) else get("show interfaces counters errors")
+        top_output = "" if has_data(top_data) else get("show processes top once")
+        version_output = "" if has_data(version_data) else get("show version")
+        ports = enrich_ports(
+            parse_interfaces_json(interface_data) if has_data(interface_data) else parse_interfaces(interface_output),
+            parse_interface_rates_json(rates_data) if has_data(rates_data) else parse_interface_rates(rates_output),
+            parse_interface_errors_json(errors_data) if has_data(errors_data) else parse_interface_errors(errors_output),
+            {},
+        )
+        traffic = traffic_summary(ports)
+        history = update_history(ports, traffic)
+        health = parse_system_health_json(top_data, "", version_data) if has_data(top_data) else parse_system_health(top_output, "", version_output)
+        return {
+            "health": health,
+            "traffic": traffic,
+            "history": compact_history(history, limit=40, include_ports=False),
+            "ports": ports,
+            "loading": {"metrics": "done"},
+        }
+
+    if scope == "health":
+        data = jsons(["show version", "show processes top once"])
+        version_data = data.get("show version") or {}
+        top_data = data.get("show processes top once") or {}
+        top_output = "" if has_data(top_data) else get("show processes top once")
+        version_output = "" if has_data(version_data) else get("show version")
+        env_output = get_optional("show system environment all") or get_optional("show environment all")
+        health = parse_system_health_json(top_data, env_output, version_data) if has_data(top_data) else parse_system_health(top_output, env_output, version_output)
+        return {
+            "health": health,
+            "alerts": build_alerts([], health, env_output, errors),
+            "loading": {"health": "done"},
+        }
+
+    if scope == "discovery":
+        data = jsons(["show lldp neighbors detail"])
+        lldp_data = data.get("show lldp neighbors detail") or {}
+        lldp_output = "" if has_data(lldp_data) else get_optional("show lldp neighbors")
+        return {
+            "lldp": parse_lldp_json(lldp_data) if has_data(lldp_data) else parse_lldp_neighbors(lldp_output),
+            "loading": {"discovery": "done"},
         }
 
     if scope == "tables":
@@ -1802,10 +1861,10 @@ def collect_state(scope="full"):
         return {"poe": parse_poe(poe_output), "integrations": parse_integrations(integration_output), "loading": {"extras": "done"}}
 
     state = collect_state("core")
-    for child_scope in ("tables", "extras", "optics", "protocols"):
+    for child_scope in ("metrics", "health", "tables", "discovery", "extras", "optics", "protocols"):
         state = merge_state(state, collect_state(child_scope))
     state["history"] = compact_history(read_json_file(HISTORY_FILE, {"traffic": [], "ports": {}}))
-    state["loading"] = {"core": "done", "tables": "done", "optics": "done", "protocols": "done", "extras": "done"}
+    state["loading"] = {"core": "done", "metrics": "done", "health": "done", "tables": "done", "discovery": "done", "optics": "done", "protocols": "done", "extras": "done"}
     if state.get("alerts"):
         state["events"] = [{"time": now_ms(), "level": "warning", "message": "Active alerts: %s" % len(state.get("alerts", []))}]
     else:
@@ -1827,7 +1886,7 @@ INDEX_HTML = r"""<!doctype html>
     .layout{width:min(1480px,100%);margin:0 auto;padding:22px clamp(14px,3vw,34px) 34px}.dashboard-section.hidden{display:none!important}.ports-page{display:none}.ports-page.active{display:block}.overview{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}.metric,.panel{border:1px solid var(--line);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}.metric{min-height:92px;padding:15px}.metric span,.muted{color:var(--muted);font-size:12px}.metric strong{display:block;margin-top:8px;overflow-wrap:anywhere;font-size:20px;line-height:1.15}.metric small{display:block;margin-top:6px;color:var(--muted);font-size:11px}.main-grid{display:grid;grid-template-columns:minmax(0,1fr) 370px;gap:16px;align-items:start}.bottom-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(320px,.85fr);gap:16px;margin-top:16px}.panel{padding:16px}.panel-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:14px}
     .legend{display:flex;gap:12px;flex-wrap:wrap;justify-content:flex-end;color:var(--muted);font-size:12px}.legend span{display:inline-flex;align-items:center;gap:6px}.dot{display:inline-block;width:9px;height:9px;border-radius:50%}.up{background:var(--green)}.down{background:var(--muted)}.media{background:var(--purple)}.warn{background:var(--amber)}
     .port-grid{display:grid;grid-template-columns:repeat(8,minmax(82px,1fr));gap:8px}.port{position:relative;min-height:104px;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--subtle);overflow:hidden;text-align:left;cursor:pointer;color:var(--ink)}.port:hover{border-color:#9fb0c2;background:var(--surface)}.port:before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--muted)}.port[data-media=true]:before{background:var(--purple)}.port[data-status=up]:before{background:var(--green)}.port[data-errors=true]:before{background:var(--amber)}.port[data-breakout=true]{min-height:128px;background:linear-gradient(180deg,var(--surface),var(--subtle))}.port-name{display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:12px;font-weight:800}.port-speed{color:var(--blue);font-size:11px;font-weight:800}.port-detail{margin-top:8px;color:var(--muted);font-size:11px;line-height:1.35;overflow-wrap:anywhere}.port-traffic{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:8px;font-size:11px}.port-traffic b{display:block;color:var(--ink);font-size:12px}.lane-dots{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:9px}.lane-dots i{height:7px;border-radius:999px;background:var(--muted)}.lane-dots i[data-status=up]{background:var(--green)}.lane-dots i[data-media=true]{background:var(--purple)}.lane-dots i[data-errors=true]{background:var(--amber)}.lane-table{width:100%;margin-top:12px;border-collapse:collapse;font-size:12px}.lane-table th,.lane-table td{padding:8px;border-bottom:1px solid var(--line);text-align:left}.lane-btn{min-height:28px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);cursor:pointer}
-    .side-stack{display:grid;gap:16px}.gauge-list{display:grid;gap:12px}.gauge-row{display:grid;grid-template-columns:56px minmax(120px,1fr) 60px;align-items:center;gap:10px;color:var(--muted);font-size:13px}meter{width:100%;height:12px}.mini-status{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:15px}.mini-status span{min-height:44px;padding:10px;border:1px solid var(--line);border-radius:8px;color:var(--muted);background:var(--subtle)}.mini-status b{display:block;margin-top:2px;color:var(--ink)}.command-form{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:10px}input{width:100%;min-height:38px;border:1px solid var(--line);border-radius:8px;padding:0 10px;color:var(--ink);background:var(--surface)}pre{min-height:210px;max-height:360px;margin:12px 0 0;overflow:auto;border:1px solid #1e293b;border-radius:8px;padding:14px;color:#d7e2ef;background:#111827;font:13px/1.55 "Cascadia Mono",Consolas,monospace;white-space:pre-wrap}
+    .side-stack{display:grid;gap:16px}.gauge-list{display:grid;gap:12px}.gauge-row{display:grid;grid-template-columns:56px minmax(120px,1fr) 60px;align-items:center;gap:10px;color:var(--muted);font-size:13px}meter{width:100%;height:12px}.mini-status{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:15px}.mini-status span{min-height:44px;padding:10px;border:1px solid var(--line);border-radius:8px;color:var(--muted);background:var(--subtle)}.mini-status b{display:block;margin-top:2px;color:var(--ink)}.command-form{display:grid;grid-template-columns:minmax(0,1fr) 92px;gap:10px}input,select{width:100%;min-height:38px;border:1px solid var(--line);border-radius:8px;padding:0 10px;color:var(--ink);background:var(--surface)}.refresh-select{width:auto;min-width:96px;height:38px;font-weight:700}pre{min-height:210px;max-height:360px;margin:12px 0 0;overflow:auto;border:1px solid #1e293b;border-radius:8px;padding:14px;color:#d7e2ef;background:#111827;font:13px/1.55 "Cascadia Mono",Consolas,monospace;white-space:pre-wrap}
     .event-list{display:grid;gap:8px;max-height:320px;margin:0;padding:0;overflow:auto;list-style:none}.event-list li{display:grid;gap:3px;min-height:54px;border-left:4px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--subtle)}.event-list li[data-level=success]{border-left-color:var(--green)}.event-list li[data-level=error]{border-left-color:var(--red)}.event-time{color:var(--muted);font-size:11px}.event-message{font-size:13px}.toast{position:fixed;right:18px;bottom:18px;max-width:min(420px,calc(100vw - 36px));padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--surface);box-shadow:var(--shadow);transform:translateY(90px);opacity:0;transition:.18s ease}.toast.show{transform:translateY(0);opacity:1}
     .modal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;padding:18px;background:rgba(15,23,42,.58);z-index:30}.modal.show{display:flex}.dialog{width:min(820px,100%);max-height:88vh;overflow:auto;border-radius:8px;border:1px solid var(--line);background:var(--surface);box-shadow:0 24px 80px rgba(0,0,0,.24)}.dialog-head{display:flex;align-items:center;justify-content:space-between;padding:16px;border-bottom:1px solid var(--line)}.dialog-body{padding:16px}.detail-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.detail-item{border:1px solid var(--line);border-radius:8px;padding:10px;background:var(--subtle)}.detail-item span{display:block;color:var(--muted);font-size:11px}.detail-item b{display:block;margin-top:5px;font-size:15px;overflow-wrap:anywhere}.port-chart{width:100%;height:180px;margin-top:12px;border:1px solid var(--line);border-radius:8px;background:var(--subtle)}
     .wide-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:16px}.table-wrap{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:8px}.data-table{width:100%;border-collapse:collapse;font-size:12px}.data-table th,.data-table td{padding:8px 9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.data-table th{position:sticky;top:0;background:var(--subtle);color:var(--muted);font-size:11px}.alert-list,.topology-list{display:grid;gap:8px;margin:0;padding:0;list-style:none}.alert-list li,.topology-list li{border-left:4px solid var(--line);border-radius:8px;padding:9px 10px;background:var(--subtle);font-size:13px}.alert-list li[data-severity=critical]{border-left-color:var(--red)}.alert-list li[data-severity=warning]{border-left-color:var(--amber)}.alert-list b{display:block}.ops-form{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.ops-form label{display:grid;gap:5px;color:var(--muted);font-size:12px;font-weight:700}.ops-form select,.ops-form input{min-height:36px;border:1px solid var(--line);border-radius:8px;padding:0 9px;background:var(--surface);color:var(--ink)}.ops-form button{align-self:end}.full{grid-column:1/-1}.chart{width:100%;height:120px;border:1px solid var(--line);border-radius:8px;background:var(--subtle)}
@@ -1835,7 +1894,7 @@ INDEX_HTML = r"""<!doctype html>
   </style>
 </head>
 <body>
-  <header class="topbar"><div><p class="eyebrow">ON-BOX CONSOLE</p><h1>Arista DCS-7050QX-32S-F</h1><nav class="nav"><button id="dashboardNav" class="ghost active" type="button">仪表盘</button><button id="portsNav" class="ghost" type="button">端口视图</button></nav></div><div class="actions"><span class="badge">EOS 本机运行</span><button id="themeBtn" class="ghost" type="button">深色</button><button id="refreshBtn" class="primary">刷新</button></div></header>
+  <header class="topbar"><div><p class="eyebrow">ON-BOX CONSOLE</p><h1>Arista DCS-7050QX-32S-F</h1><nav class="nav"><button id="dashboardNav" class="ghost active" type="button">仪表盘</button><button id="portsNav" class="ghost" type="button">端口视图</button></nav></div><div class="actions"><span class="badge">EOS 本机运行</span><select id="refreshInterval" class="refresh-select" title="自动刷新间隔"><option value="0">手动</option><option value="5000">5 秒</option><option value="10000">10 秒</option><option value="15000" selected>15 秒</option><option value="30000">30 秒</option><option value="60000">60 秒</option></select><button id="themeBtn" class="ghost" type="button">深色</button><button id="refreshBtn" class="primary">刷新</button></div></header>
   <main class="layout">
     <section class="overview dashboard-section"><article class="metric"><span>主机名</span><strong id="hostname">-</strong></article><article class="metric"><span>EOS</span><strong id="eosVersion">-</strong></article><article class="metric"><span>实时转发</span><strong id="forwardingLive">-</strong><small id="trafficSubline">-</small></article><article class="metric"><span>实时交换</span><strong id="switchingLive">-</strong><small id="capacitySubline">-</small></article></section>
     <section class="main-grid dashboard-section"><div class="panel"><div class="panel-title"><div><h2>端口概览</h2><p id="portSummary" class="muted">-</p></div><button id="openPortsBtn" class="ghost" type="button">打开端口视图</button></div><canvas id="trafficChart" class="chart" width="700" height="120"></canvas></div>
@@ -1853,16 +1912,16 @@ INDEX_HTML = r"""<!doctype html>
   <div id="portModal" class="modal"><div class="dialog"><div class="dialog-head"><h2 id="modalTitle">端口详情</h2><button id="modalClose" class="ghost">关闭</button></div><div id="modalBody" class="dialog-body"></div></div></div>
   <div id="toast" class="toast"></div>
   <script>
-    const $=s=>document.querySelector(s),el={refreshBtn:$("#refreshBtn"),themeBtn:$("#themeBtn"),dashboardNav:$("#dashboardNav"),portsNav:$("#portsNav"),openPortsBtn:$("#openPortsBtn"),hostname:$("#hostname"),eosVersion:$("#eosVersion"),forwardingLive:$("#forwardingLive"),switchingLive:$("#switchingLive"),trafficSubline:$("#trafficSubline"),capacitySubline:$("#capacitySubline"),portSummary:$("#portSummary"),portsPageSummary:$("#portsPageSummary"),portsPage:$("#portsPage"),lastRefresh:$("#lastRefresh"),cpuMeter:$("#cpuMeter"),cpuValue:$("#cpuValue"),memoryMeter:$("#memoryMeter"),memoryValue:$("#memoryValue"),temperatureMeter:$("#temperatureMeter"),temperatureValue:$("#temperatureValue"),fanStatus:$("#fanStatus"),psuStatus:$("#psuStatus"),portGrid:$("#portGrid"),commandForm:$("#commandForm"),commandInput:$("#commandInput"),commandOutput:$("#commandOutput"),eventList:$("#eventList"),alertList:$("#alertList"),lldpList:$("#lldpList"),protocolTable:$("#protocolTable"),tablesView:$("#tablesView"),transceiverTable:$("#transceiverTable"),poeTable:$("#poeTable"),integrationView:$("#integrationView"),trafficChart:$("#trafficChart"),trafficChart2:$("#trafficChart2"),chartLabel:$("#chartLabel"),opsForm:$("#opsForm"),opsAction:$("#opsAction"),opsInterface:$("#opsInterface"),opsState:$("#opsState"),opsVlan:$("#opsVlan"),opsText:$("#opsText"),opsAddress:$("#opsAddress"),opsProcess:$("#opsProcess"),opsArea:$("#opsArea"),opsNeighbor:$("#opsNeighbor"),opsConfirm:$("#opsConfirm"),opsPreview:$("#opsPreview"),opsOutput:$("#opsOutput"),toast:$("#toast"),portModal:$("#portModal"),modalTitle:$("#modalTitle"),modalBody:$("#modalBody"),modalClose:$("#modalClose")};
+    const $=s=>document.querySelector(s),el={refreshBtn:$("#refreshBtn"),refreshInterval:$("#refreshInterval"),themeBtn:$("#themeBtn"),dashboardNav:$("#dashboardNav"),portsNav:$("#portsNav"),openPortsBtn:$("#openPortsBtn"),hostname:$("#hostname"),eosVersion:$("#eosVersion"),forwardingLive:$("#forwardingLive"),switchingLive:$("#switchingLive"),trafficSubline:$("#trafficSubline"),capacitySubline:$("#capacitySubline"),portSummary:$("#portSummary"),portsPageSummary:$("#portsPageSummary"),portsPage:$("#portsPage"),lastRefresh:$("#lastRefresh"),cpuMeter:$("#cpuMeter"),cpuValue:$("#cpuValue"),memoryMeter:$("#memoryMeter"),memoryValue:$("#memoryValue"),temperatureMeter:$("#temperatureMeter"),temperatureValue:$("#temperatureValue"),fanStatus:$("#fanStatus"),psuStatus:$("#psuStatus"),portGrid:$("#portGrid"),commandForm:$("#commandForm"),commandInput:$("#commandInput"),commandOutput:$("#commandOutput"),eventList:$("#eventList"),alertList:$("#alertList"),lldpList:$("#lldpList"),protocolTable:$("#protocolTable"),tablesView:$("#tablesView"),transceiverTable:$("#transceiverTable"),poeTable:$("#poeTable"),integrationView:$("#integrationView"),trafficChart:$("#trafficChart"),trafficChart2:$("#trafficChart2"),chartLabel:$("#chartLabel"),opsForm:$("#opsForm"),opsAction:$("#opsAction"),opsInterface:$("#opsInterface"),opsState:$("#opsState"),opsVlan:$("#opsVlan"),opsText:$("#opsText"),opsAddress:$("#opsAddress"),opsProcess:$("#opsProcess"),opsArea:$("#opsArea"),opsNeighbor:$("#opsNeighbor"),opsConfirm:$("#opsConfirm"),opsPreview:$("#opsPreview"),opsOutput:$("#opsOutput"),toast:$("#toast"),portModal:$("#portModal"),modalTitle:$("#modalTitle"),modalBody:$("#modalBody"),modalClose:$("#modalClose")};
     let toastTimer=null,currentPorts=[],currentPortCards=[],activePortName=null;const portHistory={};function esc(v){return String(v??"-").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]))}function toast(m){el.toast.textContent=m;el.toast.classList.add("show");clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.toast.classList.remove("show"),2600)}function fmt(v){return v?new Intl.DateTimeFormat("zh-CN",{month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"}).format(new Date(v)):"-"}async function req(u,o={}){const r=await fetch(u,{headers:{"Content-Type":"application/json"},...o});const p=await r.json();if(!r.ok||p.ok===false)throw new Error(p.error||`HTTP ${r.status}`);return p}function pct(v){return Number.isFinite(Number(v))?`${Number(v).toFixed(0)}%`:"-"}function mbps(v){return `${Number(v||0).toFixed(2)}M`}
     function setTheme(theme){document.body.dataset.theme=theme;localStorage.setItem("theme",theme);el.themeBtn.textContent=theme==="dark"?"浅色":"深色"}setTheme(localStorage.getItem("theme")||"light");function showPage(page){const ports=page==="ports";document.querySelectorAll(".dashboard-section").forEach(x=>x.classList.toggle("hidden",ports));el.portsPage.classList.toggle("active",ports);el.dashboardNav.classList.toggle("active",!ports);el.portsNav.classList.toggle("active",ports);history.replaceState(null,"",ports?"/ports":"/")} 
-    function detail(label,value){return `<div class="detail-item"><span>${label}</span><b>${esc(value)}</b></div>`}function uniq(values){return [...new Set(values.filter(v=>v&&v!=="-"))]}function portBase(name){const m=String(name||"").match(/^Ethernet(\d+)\/(\d+)$/i);return m?{base:`Ethernet${m[1]}`,lane:Number(m[2])}:null}function groupPorts(ports){const out=[],groups={};ports.forEach(p=>{const b=portBase(p.name);if(!b){out.push({...p,kind:"port"});return}if(!groups[b.base]){groups[b.base]={kind:"breakout",name:b.base,label:b.base,lanes:[]};out.push(groups[b.base])}groups[b.base].lanes.push({...p,lane:b.lane,kind:"lane"})});return out.map(item=>item.kind==="breakout"?summarizeGroup(item):item)}function summarizeGroup(g){const lanes=g.lanes.sort((a,b)=>(a.lane||0)-(b.lane||0)),up=lanes.filter(p=>p.status==="up").length,media=lanes.filter(p=>p.hasMedia&&p.status!=="up").length,errors=lanes.reduce((n,p)=>n+Number(p.errors||0),0),rx=lanes.reduce((n,p)=>n+Number(p.rxMbps||0),0),tx=lanes.reduce((n,p)=>n+Number(p.txMbps||0),0),speeds=uniq(lanes.map(p=>p.speed)),vlans=uniq(lanes.map(p=>p.vlan)),medias=uniq(lanes.map(p=>p.media));return {...g,lanes,status:up?"up":"down",hasMedia:media>0,errors,rxMbps:rx,txMbps:tx,speed:`${lanes.length}x${speeds[0]||"lane"}`,vlan:vlans.length<=2?vlans.join(", ")||"-":"Mixed",media:medias.length<=2?medias.join(", ")||"-":"Mixed",description:`${up}/${lanes.length} lanes up`}}function showPortDetail(p){if(!p)return;const o=p.transceiver||{};activePortName=p.name;el.modalTitle.textContent=`${p.label||p.name} 端口详情`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("状态",p.status)}${detail("VLAN",p.vlan)}${detail("双工",p.duplex)}${detail("协商/网速",p.speed)}${detail("介质",p.media)}${detail("RX Mbps",Number(p.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(p.txMbps||0).toFixed(2))}${detail("RX Kpps",Number(p.rxKpps||0).toFixed(2))}${detail("TX Kpps",Number(p.txKpps||0).toFixed(2))}${detail("错误计数",p.errors||0)}${detail("描述",p.description||"-")}${detail("光模块",o.present===false?"Not Present":(o.type||"-"))}${detail("厂商",o.vendor||"-")}${detail("序列号",o.serial||"-")}${detail("DOM 温度",o.temperature||"-")}${detail("TX/RX 光功率",`${o.txPower||"-"} / ${o.rxPower||"-"}`)}</div><canvas id="portLineChart" class="port-chart" width="760" height="180"></canvas><pre>${esc([p.statusLine,p.rateLine,p.errorLine,o.raw,(o.alerts||[]).join("\n")].filter(Boolean).join("\n"))}</pre>`;el.portModal.classList.add("show");setTimeout(()=>drawPortChart(p.name),0)}function showPortGroup(g){activePortName=null;el.modalTitle.textContent=`${g.label} QSFP breakout`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("汇总状态",g.description)}${detail("Lane 数量",g.lanes.length)}${detail("VLAN",g.vlan)}${detail("介质",g.media)}${detail("RX Mbps",Number(g.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(g.txMbps||0).toFixed(2))}${detail("错误计数",g.errors||0)}</div><table class="lane-table"><thead><tr><th>Lane</th><th>状态</th><th>VLAN</th><th>速率</th><th>RX/TX</th><th>错误</th><th></th></tr></thead><tbody>${g.lanes.map(p=>`<tr><td>${esc(p.label||p.name)}</td><td>${esc(p.status)}</td><td>${esc(p.vlan)}</td><td>${esc(p.speed)}</td><td>${mbps(p.rxMbps)} / ${mbps(p.txMbps)}</td><td>${esc(p.errors||0)}</td><td><button class="lane-btn" data-port="${esc(p.name)}">查看</button></td></tr>`).join("")}</tbody></table>`;el.portModal.classList.add("show")}function showPort(i){const p=currentPortCards[i];if(!p)return;p.kind==="breakout"?showPortGroup(p):showPortDetail(p)}
+    function detail(label,value){return `<div class="detail-item"><span>${label}</span><b>${esc(value)}</b></div>`}function uniq(values){return [...new Set(values.filter(v=>v&&v!=="-"))]}function diagLines(...values){return values.flatMap(v=>String(v||"").split("\n")).map(v=>v.trim()).filter(v=>v&&v!=="eAPI rates"&&v!=="eAPI errors").join("\n")}function portBase(name){const m=String(name||"").match(/^Ethernet(\d+)\/(\d+)$/i);return m?{base:`Ethernet${m[1]}`,lane:Number(m[2])}:null}function groupPorts(ports){const out=[],groups={};ports.forEach(p=>{const b=portBase(p.name);if(!b){out.push({...p,kind:"port"});return}if(!groups[b.base]){groups[b.base]={kind:"breakout",name:b.base,label:b.base,lanes:[]};out.push(groups[b.base])}groups[b.base].lanes.push({...p,lane:b.lane,kind:"lane"})});return out.map(item=>item.kind==="breakout"?summarizeGroup(item):item)}function summarizeGroup(g){const lanes=g.lanes.sort((a,b)=>(a.lane||0)-(b.lane||0)),up=lanes.filter(p=>p.status==="up").length,media=lanes.filter(p=>p.hasMedia&&p.status!=="up").length,errors=lanes.reduce((n,p)=>n+Number(p.errors||0),0),rx=lanes.reduce((n,p)=>n+Number(p.rxMbps||0),0),tx=lanes.reduce((n,p)=>n+Number(p.txMbps||0),0),speeds=uniq(lanes.map(p=>p.speed)),vlans=uniq(lanes.map(p=>p.vlan)),medias=uniq(lanes.map(p=>p.media));return {...g,lanes,status:up?"up":"down",hasMedia:media>0,errors,rxMbps:rx,txMbps:tx,speed:`${lanes.length}x${speeds[0]||"lane"}`,vlan:vlans.length<=2?vlans.join(", ")||"-":"Mixed",media:medias.length<=2?medias.join(", ")||"-":"Mixed",description:`${up}/${lanes.length} lanes up`}}function showPortDetail(p){if(!p)return;const o=p.transceiver||{},diag=diagLines(p.statusLine,p.rateLine,p.errorLine,o.raw,(o.alerts||[]).join("\n"));activePortName=p.name;el.modalTitle.textContent=`${p.label||p.name} 端口详情`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("状态",p.status)}${detail("VLAN",p.vlan)}${detail("双工",p.duplex)}${detail("协商/网速",p.speed)}${detail("介质",p.media)}${detail("RX Mbps",Number(p.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(p.txMbps||0).toFixed(2))}${detail("RX Kpps",Number(p.rxKpps||0).toFixed(2))}${detail("TX Kpps",Number(p.txKpps||0).toFixed(2))}${detail("错误计数",p.errors||0)}${detail("描述",p.description||"-")}${detail("光模块",o.present===false?"Not Present":(o.type||"-"))}${detail("厂商",o.vendor||"-")}${detail("序列号",o.serial||"-")}${detail("DOM 温度",o.temperature||"-")}${detail("TX/RX 光功率",`${o.txPower||"-"} / ${o.rxPower||"-"}`)}</div><canvas id="portLineChart" class="port-chart" width="760" height="180"></canvas>${diag?`<pre>${esc(diag)}</pre>`:""}`;el.portModal.classList.add("show");setTimeout(()=>drawPortChart(p.name),0)}function showPortGroup(g){activePortName=null;el.modalTitle.textContent=`${g.label} QSFP breakout`;el.modalBody.innerHTML=`<div class="detail-grid">${detail("汇总状态",g.description)}${detail("Lane 数量",g.lanes.length)}${detail("VLAN",g.vlan)}${detail("介质",g.media)}${detail("RX Mbps",Number(g.rxMbps||0).toFixed(2))}${detail("TX Mbps",Number(g.txMbps||0).toFixed(2))}${detail("错误计数",g.errors||0)}</div><table class="lane-table"><thead><tr><th>Lane</th><th>状态</th><th>VLAN</th><th>速率</th><th>RX/TX</th><th>错误</th><th></th></tr></thead><tbody>${g.lanes.map(p=>`<tr><td>${esc(p.label||p.name)}</td><td>${esc(p.status)}</td><td>${esc(p.vlan)}</td><td>${esc(p.speed)}</td><td>${mbps(p.rxMbps)} / ${mbps(p.txMbps)}</td><td>${esc(p.errors||0)}</td><td><button class="lane-btn" data-port="${esc(p.name)}">查看</button></td></tr>`).join("")}</tbody></table>`;el.portModal.classList.add("show")}function showPort(i){const p=currentPortCards[i];if(!p)return;p.kind==="breakout"?showPortGroup(p):showPortDetail(p)}
     const historyData=[];function drawSingleChart(c,values,color){if(!c)return;const ctx=c.getContext("2d"),w=c.width,h=c.height,max=Math.max(1,...values);ctx.clearRect(0,0,w,h);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=20;y<h;y+=25){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();values.forEach((v,i)=>{const x=i*(w/Math.max(1,values.length-1)),y=h-12-(v/max)*(h-24);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}function drawChart(t){historyData.push(Number(t.totalMbps||0));while(historyData.length>40)historyData.shift();drawSingleChart(el.trafficChart,historyData,"#0f766e");drawSingleChart(el.trafficChart2,historyData,"#0f766e");el.chartLabel.textContent=`${Number(t.totalMbps||0).toFixed(2)} Mbps / ${Number(t.totalKpps||0).toFixed(2)} Kpps`}function drawPortChart(name){const c=$("#portLineChart"),h=portHistory[name]||[];if(!c||!h.length)return;const rx=h.map(x=>x.rx),tx=h.map(x=>x.tx),ctx=c.getContext("2d"),w=c.width,ht=c.height,max=Math.max(1,...rx,...tx);ctx.clearRect(0,0,w,ht);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=24;y<ht;y+=34){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();function line(vals,color){ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();vals.forEach((v,i)=>{const x=i*(w/Math.max(1,vals.length-1)),y=ht-18-(v/max)*(ht-36);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}line(rx,"#2563eb");line(tx,"#0f766e");ctx.fillStyle=getComputedStyle(document.body).getPropertyValue("--muted").trim();ctx.fillText("RX blue / TX green",10,14)}
     function rows(headers,items,map){return `<thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${map(item).map(v=>`<td>${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>`}function renderExtra(state){const alerts=state.alerts||[];el.alertList.innerHTML=alerts.length?alerts.map(a=>`<li data-severity="${esc(a.severity)}"><b>${esc(a.title)}</b>${esc(a.message)}</li>`).join(""):"<li>暂无告警</li>";el.lldpList.innerHTML=(state.lldp||[]).length?(state.lldp||[]).map(n=>`<li><b>${esc(n.label)}</b> → ${esc(n.neighbor)} / ${esc(n.neighborPort)}</li>`).join(""):"<li>未发现 LLDP 邻居</li>";const proto=[...(state.protocols?.ospf||[]).map(x=>({type:"OSPF",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.ospfv3||[]).map(x=>({type:"OSPFv3",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.bgp||[]).map(x=>({type:"BGP",a:x.peer,b:x.state,c:x.asn}))];el.protocolTable.innerHTML=rows(["协议","对象","状态","接口/AS"],proto,x=>[x.type,x.a,x.b,x.c]);const tableItems=[...(state.vlans||[]).slice(0,40).map(x=>({type:"VLAN",a:x.id,b:x.name,c:x.status,d:x.ports})),...(state.arp||[]).slice(0,40).map(x=>({type:"ARP",a:x.address,b:x.mac,c:x.interface,d:""})),...(state.fdb||[]).slice(0,40).map(x=>({type:"FDB",a:x.vlan,b:x.mac,c:x.type,d:x.port}))];el.tablesView.innerHTML=rows(["类型","键","值","状态","端口"],tableItems,x=>[x.type,x.a,x.b,x.c,x.d]);const optics=(state.transceivers||[]).filter(x=>x.present!==false).slice(0,96);el.transceiverTable.innerHTML=optics.length?rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],optics,x=>[x.interface,x.type,x.vendor,x.model,x.serial,x.temperature,`${x.txPower||"-"} / ${x.rxPower||"-"}`,(x.alerts||[]).join("; ")]):rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],[],x=>[]);const poe=state.poe||{},poeRows=poe.ports||[];el.poeTable.innerHTML=poeRows.length?rows(["接口","Admin","状态","功率","原始行"],poeRows,x=>[x.interface,x.admin,x.state,x.watts,x.raw]):rows(["接口","Admin","状态","功率","原始行"],[{interface:"-",admin:"-",state:poe.supported===false?"当前机型/系统未返回 PoE 数据":"暂无 PoE 数据",watts:"-",raw:""}],x=>[x.interface,x.admin,x.state,x.watts,x.raw]);const i=state.integrations||{};el.integrationView.innerHTML=`<span>Syslog <b>${i.syslog?"ON":"OFF"}</b></span><span>sFlow <b>${i.sflow?"ON":"OFF"}</b></span><span>NetFlow/IPFIX <b>${i.netflow?"ON":"OFF"}</b></span><span>采集 <b>${(state.vlans||[]).length} VLAN / ${(state.arp||[]).length} ARP / ${(state.fdb||[]).length} FDB</b></span>`;if(state.history?.traffic?.length)historyData.splice(0,historyData.length,...state.history.traffic.slice(-80).map(x=>Number(x.totalMbps||0)));drawChart(state.traffic||{})}
     function render(state){const d=state.device||{},h=state.health||{},t=state.traffic||{},ports=state.ports||[],up=ports.filter(p=>p.status==="up").length,media=ports.filter(p=>p.hasMedia&&p.status!=="up").length,err=ports.filter(p=>Number(p.errors||0)>0).length;currentPorts=ports;currentPortCards=groupPorts(ports);ports.forEach(p=>{const k=p.name;const saved=(state.history?.ports?.[k]||[]).slice(-80).map(x=>({rx:Number(x.rxMbps||0),tx:Number(x.txMbps||0)}));portHistory[k]=saved.length?saved:(portHistory[k]||[]);if(!saved.length)portHistory[k].push({rx:Number(p.rxMbps||0),tx:Number(p.txMbps||0)});while(portHistory[k].length>80)portHistory[k].shift()});el.hostname.textContent=d.hostname||"-";el.eosVersion.textContent=d.eosVersion||"-";el.forwardingLive.textContent=d.forwardingRate||t.packetRateLabel||"-";el.switchingLive.textContent=d.switchingCapacity||t.throughputLabel||"-";el.trafficSubline.textContent=`RX ${mbps(t.rxMbps)} / TX ${mbps(t.txMbps)}`;el.capacitySubline.textContent=`占用 ${Number(t.capacityUtilization||0).toFixed(4)}% of 2.56Tbps`;const summary=`${up}/${ports.length} logical up, ${currentPortCards.length} cards, ${media} media, ${err} error`;el.portSummary.textContent=summary;el.portsPageSummary.textContent=summary;el.lastRefresh.textContent=fmt(d.lastRefresh);el.cpuMeter.value=Number(h.cpu||0);el.cpuValue.textContent=pct(h.cpu);el.memoryMeter.value=Number(h.memory||0);el.memoryValue.textContent=pct(h.memory);el.temperatureMeter.value=Number(h.temperature||0);el.temperatureValue.textContent=Number.isFinite(Number(h.temperature))?`${h.temperature}C`:"-";el.fanStatus.textContent=h.fanStatus||"-";el.psuStatus.textContent=h.psuStatus||"-";el.portGrid.innerHTML=currentPortCards.map((p,i)=>`<button class="port" data-index="${i}" data-breakout="${p.kind==="breakout"}" data-status="${p.status}" data-media="${Boolean(p.hasMedia)}" data-errors="${Number(p.errors||0)>0}"><div class="port-name"><span>${esc(p.label||p.name)}</span><span class="port-speed">${esc(p.speed)}</span></div><div class="port-detail">${esc(p.media)} / VLAN ${esc(p.vlan)}<br>${esc(p.description||p.status)}</div>${p.kind==="breakout"?`<div class="lane-dots">${p.lanes.map(x=>`<i title="${esc(x.label||x.name)}" data-status="${esc(x.status)}" data-media="${Boolean(x.hasMedia&&x.status!=="up")}" data-errors="${Number(x.errors||0)>0}"></i>`).join("")}</div>`:""}<div class="port-traffic"><span>RX <b>${mbps(p.rxMbps)}</b></span><span>TX <b>${mbps(p.txMbps)}</b></span></div></button>`).join("");if(activePortName&&el.portModal.classList.contains("show"))drawPortChart(activePortName);el.eventList.innerHTML=(state.events||[]).map(e=>`<li data-level="${e.level||"info"}"><span class="event-time">${fmt(e.time)} / ${esc(e.level||"info")}</span><span class="event-message">${esc(e.message)}</span></li>`).join("");renderExtra(state)}
-    let refreshRun=0;const progressiveScopes=["tables","extras","optics","protocols"];async function load(scope="state"){const p=scope==="state"?await req("/api/state"):await req("/api/refresh",{method:"POST",body:JSON.stringify({scope})});render(p.state);return p.state}async function loadProgressive(){const run=++refreshRun;for(const scope of progressiveScopes){if(run!==refreshRun)return;try{await load(scope)}catch(e){toast(`${scope}: ${e.message}`)}}}async function boot(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="加载中";try{await load("core");loadProgressive()}catch(e){toast(e.message);await load().catch(()=>{})}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}async function refresh(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="刷新中";try{await load("core");toast("核心状态已刷新，其余数据继续加载");loadProgressive()}catch(e){toast(e.message)}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}
+    let refreshRun=0,refreshTimer=null,autoRefreshBusy=false;const progressiveScopes=["metrics","health","tables","discovery","extras","optics","protocols"];async function load(scope="state"){const p=scope==="state"?await req("/api/state"):await req("/api/refresh",{method:"POST",body:JSON.stringify({scope})});render(p.state);return p.state}async function loadProgressive(){const run=++refreshRun;for(const scope of progressiveScopes){if(run!==refreshRun)return;try{await load(scope)}catch(e){toast(`${scope}: ${e.message}`)}}}async function boot(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="加载中";try{await load("core");loadProgressive()}catch(e){toast(e.message);await load().catch(()=>{})}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}async function refresh(silent=false){el.refreshBtn.disabled=true;el.refreshBtn.textContent="刷新中";try{await load("core");if(!silent)toast("核心状态已刷新，其余数据继续加载");loadProgressive()}catch(e){if(!silent)toast(e.message)}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}function setAutoRefresh(){if(refreshTimer)clearInterval(refreshTimer);const ms=Number(el.refreshInterval?.value||0);localStorage.setItem("refreshInterval",String(ms));if(ms>0)refreshTimer=setInterval(async()=>{if(document.hidden||autoRefreshBusy)return;autoRefreshBusy=true;try{await refresh(true)}finally{autoRefreshBusy=false}},ms)}
     function opsPayload(dryRun){return{action:el.opsAction.value,confirm:el.opsConfirm.value,dryRun,params:{interface:el.opsInterface.value,state:el.opsState.value,mode:el.opsState.value,vlan:el.opsVlan.value,nativeVlan:el.opsText.value,description:el.opsText.value,name:el.opsText.value,address:el.opsAddress.value,network:el.opsAddress.value,addressFamily:el.opsAddress.value||"ipv4",process:el.opsProcess.value,asn:el.opsProcess.value,area:el.opsArea.value,remoteAs:el.opsArea.value,neighbor:el.opsNeighbor.value}}}async function runOps(dryRun){el.opsOutput.textContent=dryRun?"生成配置中...":"执行配置中...";try{const p=await req("/api/config",{method:"POST",body:JSON.stringify(opsPayload(dryRun))});el.opsOutput.textContent=(p.commands||[]).join("\n")+(p.diff?`\n\nDIFF:\n${p.diff}`:"")+(p.output?`\n\n${p.output}`:"");if(!dryRun){toast("配置已提交");refresh()}}catch(err){el.opsOutput.textContent=`ERROR: ${err.message}`}}
-    el.refreshBtn.addEventListener("click",refresh);el.themeBtn.addEventListener("click",()=>setTheme(document.body.dataset.theme==="dark"?"light":"dark"));el.dashboardNav.addEventListener("click",()=>showPage("dashboard"));el.portsNav.addEventListener("click",()=>showPage("ports"));el.openPortsBtn.addEventListener("click",()=>showPage("ports"));el.portGrid.addEventListener("click",e=>{const card=e.target.closest(".port");if(card)showPort(Number(card.dataset.index))});el.modalBody.addEventListener("click",e=>{const btn=e.target.closest(".lane-btn");if(btn){const p=currentPorts.find(x=>x.name===btn.dataset.port);showPortDetail(p)}});el.modalClose.addEventListener("click",()=>el.portModal.classList.remove("show"));el.portModal.addEventListener("click",e=>{if(e.target===el.portModal)el.portModal.classList.remove("show")});el.opsPreview.addEventListener("click",()=>runOps(true));el.opsForm.addEventListener("submit",e=>{e.preventDefault();runOps(false)});el.commandForm.addEventListener("submit",async e=>{e.preventDefault();const command=el.commandInput.value.trim();if(!command)return;el.commandOutput.textContent=`> ${command}\n运行中...`;try{const p=await req("/api/command",{method:"POST",body:JSON.stringify({command})});el.commandOutput.textContent=`> ${p.command}\n${p.output}`}catch(err){el.commandOutput.textContent=`> ${command}\nERROR: ${err.message}`}});document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh()});showPage(location.pathname==="/ports"?"ports":"dashboard");boot();setInterval(()=>load().catch(()=>{}),15000);
+    el.refreshBtn.addEventListener("click",()=>refresh(false));el.refreshInterval.addEventListener("change",setAutoRefresh);el.themeBtn.addEventListener("click",()=>setTheme(document.body.dataset.theme==="dark"?"light":"dark"));el.dashboardNav.addEventListener("click",()=>showPage("dashboard"));el.portsNav.addEventListener("click",()=>showPage("ports"));el.openPortsBtn.addEventListener("click",()=>showPage("ports"));el.portGrid.addEventListener("click",e=>{const card=e.target.closest(".port");if(card)showPort(Number(card.dataset.index))});el.modalBody.addEventListener("click",e=>{const btn=e.target.closest(".lane-btn");if(btn){const p=currentPorts.find(x=>x.name===btn.dataset.port);showPortDetail(p)}});el.modalClose.addEventListener("click",()=>el.portModal.classList.remove("show"));el.portModal.addEventListener("click",e=>{if(e.target===el.portModal)el.portModal.classList.remove("show")});el.opsPreview.addEventListener("click",()=>runOps(true));el.opsForm.addEventListener("submit",e=>{e.preventDefault();runOps(false)});el.commandForm.addEventListener("submit",async e=>{e.preventDefault();const command=el.commandInput.value.trim();if(!command)return;el.commandOutput.textContent=`> ${command}\n运行中...`;try{const p=await req("/api/command",{method:"POST",body:JSON.stringify({command})});el.commandOutput.textContent=`> ${p.command}\n${p.output}`}catch(err){el.commandOutput.textContent=`> ${command}\nERROR: ${err.message}`}});document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh(true)});showPage(location.pathname==="/ports"?"ports":"dashboard");const savedRefresh=localStorage.getItem("refreshInterval");if(savedRefresh!==null&&el.refreshInterval.querySelector(`option[value="${savedRefresh}"]`))el.refreshInterval.value=savedRefresh;boot();setAutoRefresh();
   </script>
 </body>
 </html>"""
@@ -1959,7 +2018,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/refresh":
                 payload = self.read_json()
                 scope = str(payload.get("scope") or "full").lower()
-                if scope not in ("core", "tables", "optics", "protocols", "extras", "full"):
+                if scope not in ("core", "metrics", "health", "tables", "discovery", "optics", "protocols", "extras", "full"):
                     raise ValueError("Unknown refresh scope.")
                 state = collect_state(scope)
                 Handler.cached_state = state if scope == "full" else merge_state(Handler.cached_state, state)
