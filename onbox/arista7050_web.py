@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import csv
 import difflib
+import io
 import json
 import os
 import re
@@ -12,11 +14,15 @@ import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
+import urllib.error
+import urllib.request
 
 MODEL = "Arista DCS-7050QX-32S-F"
 DATA_DIR = os.environ.get("WEB_DATA_DIR", "/mnt/flash")
 HISTORY_FILE = os.environ.get("WEB_HISTORY_FILE", os.path.join(DATA_DIR, "arista7050_web_history.json"))
 AUDIT_FILE = os.environ.get("WEB_AUDIT_FILE", os.path.join(DATA_DIR, "arista7050_web_audit.jsonl"))
+EAPI_URL = os.environ.get("WEB_EAPI_URL", "http://localhost:8080/command-api")
+EAPI_ENABLED = os.environ.get("WEB_USE_EAPI", "1").lower() not in ("0", "false", "no")
 READ_ONLY = re.compile(r"^(show|ping|traceroute|traceroute6|dir|more)\b", re.I)
 BLOCKED = re.compile(r"^(configure|conf|enable|reload|reboot|write|copy|delete|erase|bash|sudo|install)\b", re.I)
 
@@ -105,6 +111,82 @@ def run_cli(command, timeout=22):
     raise RuntimeError(last_error or "No EOS CLI runner found.")
 
 
+def run_eapi(commands, fmt="json", timeout=12):
+    if not EAPI_ENABLED:
+        raise RuntimeError("eAPI disabled by WEB_USE_EAPI.")
+    if isinstance(commands, str):
+        commands = [commands]
+    commands = [str(command).strip() for command in commands if str(command).strip()]
+    for command in commands:
+        if not is_safe_command(command):
+            raise ValueError("Only read-only commands are allowed: show / ping / traceroute / dir / more.")
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "runCmds",
+        "params": {"version": 1, "cmds": commands, "format": fmt},
+        "id": "arista-webui-%s" % now_ms(),
+    }
+    request = urllib.request.Request(
+        EAPI_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.URLError as exc:
+        raise RuntimeError("eAPI unavailable: %s" % exc)
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise RuntimeError("eAPI returned non-JSON response.")
+    if data.get("error"):
+        error = data.get("error") or {}
+        details = error.get("data") or error.get("message") or error
+        raise RuntimeError("eAPI command failed: %s" % details)
+    result = data.get("result")
+    if not isinstance(result, list):
+        raise RuntimeError("eAPI returned unexpected result.")
+    return result
+
+
+def eapi_text_value(item):
+    if isinstance(item, dict):
+        return str(item.get("output", "")).strip()
+    return str(item or "").strip()
+
+
+def run_eapi_text(command, timeout=12):
+    result = run_eapi([command], fmt="text", timeout=timeout)
+    return eapi_text_value(result[0]) if result else ""
+
+
+def run_read_command(command, timeout=22):
+    try:
+        return run_eapi_text(command, timeout=min(timeout, 12))
+    except Exception:
+        return run_cli(command, timeout=timeout)
+
+
+def run_eapi_json_map(commands, timeout=12):
+    mapping = {}
+    try:
+        results = run_eapi(commands, fmt="json", timeout=timeout)
+        for command, result in zip(commands, results):
+            mapping[command] = result if isinstance(result, dict) else {}
+        return mapping
+    except Exception:
+        pass
+    for command in commands:
+        try:
+            result = run_eapi([command], fmt="json", timeout=timeout)
+            mapping[command] = result[0] if result and isinstance(result[0], dict) else {}
+        except Exception:
+            mapping[command] = {}
+    return mapping
+
+
 def run_eos_script(script, timeout=25):
     runners = [["/usr/bin/Cli", "-c", script], ["Cli", "-c", script], ["/usr/bin/FastCli", "-p", "15", "-c", script]]
     last_error = None
@@ -150,6 +232,354 @@ def parse_version(output):
     if serial_match:
         serial = serial_match.group(1).strip()
     return version, serial
+
+
+def parse_version_json(data):
+    data = data or {}
+    return str(data.get("version") or "-"), str(data.get("serialNumber") or "-")
+
+
+def interface_sort_key(name):
+    text = str(name or "")
+    prefix = re.sub(r"[\d/].*$", "", text)
+    numbers = [int(part) for part in re.findall(r"\d+", text)]
+    return (prefix, numbers, text)
+
+
+def format_bandwidth(bps):
+    try:
+        value = float(bps)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    units = [(1000000000000.0, "T"), (1000000000.0, "G"), (1000000.0, "M"), (1000.0, "K")]
+    for factor, suffix in units:
+        if value >= factor:
+            number = value / factor
+            return ("%g%s" % (number, suffix)).upper()
+    return "%gbps" % value
+
+
+def format_duration(seconds):
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return "-"
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return "%dd %02dh %02dm" % (days, hours, minutes)
+    if hours:
+        return "%dh %02dm %02ds" % (hours, minutes, seconds)
+    return "%dm %02ds" % (minutes, seconds)
+
+
+def normalize_duplex(value):
+    lower = str(value or "").lower()
+    if "full" in lower:
+        return "full"
+    if "half" in lower:
+        return "half"
+    return clean_optic_value(value)
+
+
+def parse_interfaces_json(data):
+    statuses = (data or {}).get("interfaceStatuses") or {}
+    ports = []
+    for name, item in sorted(statuses.items(), key=lambda pair: interface_sort_key(pair[0])):
+        normalized = normalize_interface(name)
+        if not re.match(r"^Ethernet\d", normalized, re.I):
+            continue
+        vlan_info = item.get("vlanInformation") or {}
+        vlan = vlan_info.get("vlanId")
+        if vlan is None:
+            vlan = vlan_info.get("interfaceMode") or vlan_info.get("interfaceForwardingModel") or "-"
+        link = str(item.get("linkStatus") or item.get("lineProtocolStatus") or "").lower()
+        media = clean_optic_value(item.get("interfaceType"))
+        status = "up" if link in ("connected", "up") else "down"
+        port = {
+            "name": normalized,
+            "label": short_interface_name(normalized),
+            "media": media,
+            "speed": format_bandwidth(item.get("bandwidth")),
+            "duplex": normalize_duplex(item.get("duplex")),
+            "status": status,
+            "vlan": str(vlan),
+            "description": str(item.get("description") or ""),
+            "rxMbps": 0.0,
+            "txMbps": 0.0,
+            "rxKpps": 0.0,
+            "txKpps": 0.0,
+            "errors": 0,
+            "statusLine": "%s %s vlan=%s speed=%s media=%s" % (short_interface_name(normalized), link or "-", vlan, format_bandwidth(item.get("bandwidth")), media),
+        }
+        port["hasMedia"] = bool(media and media.lower() not in ("-", "not present"))
+        ports.append(port)
+    return ports
+
+
+def parse_interface_rates_json(data):
+    rates = {}
+    for name, item in ((data or {}).get("interfaces") or {}).items():
+        key = normalize_interface(name).lower()
+        in_bps = float(item.get("inBpsRate") or 0)
+        out_bps = float(item.get("outBpsRate") or 0)
+        in_pps = float(item.get("inPpsRate") or item.get("inPktsRate") or 0)
+        out_pps = float(item.get("outPpsRate") or item.get("outPktsRate") or 0)
+        rates[key] = {
+            "rxMbps": round(in_bps / 1000000.0, 4),
+            "txMbps": round(out_bps / 1000000.0, 4),
+            "rxKpps": round(in_pps / 1000.0, 4),
+            "txKpps": round(out_pps / 1000.0, 4),
+            "rateLine": "eAPI rates",
+        }
+    return rates
+
+
+def parse_interface_errors_json(data):
+    errors = {}
+    for name, item in ((data or {}).get("interfaceErrorCounters") or {}).items():
+        total = 0
+        for value in item.values():
+            if isinstance(value, (int, float)):
+                total += int(value)
+        errors[normalize_interface(name).lower()] = {"errors": total, "errorLine": "eAPI errors"}
+    return errors
+
+
+def parse_system_health_json(top_data, environment_output, version_data):
+    health = parse_environment(environment_output)
+    cpu_info = (top_data or {}).get("cpuInfo") or {}
+    cpu_values = cpu_info.get("%Cpu(s)") or next((value for value in cpu_info.values() if isinstance(value, dict)), {})
+    idle = float(cpu_values.get("idle") or 0) if isinstance(cpu_values, dict) else 0
+    cpu = max(0, min(100, round(100 - idle))) if idle else 0
+
+    physical = ((top_data or {}).get("memInfo") or {}).get("physicalMem") or {}
+    total_kib = float(physical.get("memTotal") or (version_data or {}).get("memTotal") or 0)
+    used_kib = float(physical.get("memUsed") or 0)
+    free_kib = float(physical.get("memFree") or (version_data or {}).get("memFree") or 0)
+    buffer_kib = float(physical.get("memBuffer") or 0)
+    available_kib = free_kib + buffer_kib if buffer_kib else free_kib
+    if not used_kib and total_kib:
+        used_kib = max(0.0, total_kib - available_kib)
+    memory = round((used_kib / total_kib) * 100) if total_kib else 0
+    health.update(
+        {
+            "cpu": cpu,
+            "memory": memory,
+            "memoryTotalMiB": round(total_kib / 1024.0, 1) if total_kib else 0,
+            "memoryUsedMiB": round(used_kib / 1024.0, 1) if used_kib else 0,
+            "memoryAvailableMiB": round(available_kib / 1024.0, 1) if available_kib else 0,
+        }
+    )
+    return health
+
+
+def parse_lldp_json(data):
+    rows = []
+    neighbors = (data or {}).get("lldpNeighbors") or {}
+    if isinstance(neighbors, list):
+        iterable = [(item.get("port") or item.get("interface") or "-", {"lldpNeighborInfo": [item]}) for item in neighbors if isinstance(item, dict)]
+    else:
+        iterable = neighbors.items()
+    for port, entry in iterable:
+        infos = []
+        if isinstance(entry, dict):
+            infos = entry.get("lldpNeighborInfo") or entry.get("neighbors") or []
+        elif isinstance(entry, list):
+            infos = entry
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            iface = normalize_interface(port)
+            neighbor_iface = info.get("neighborInterfaceInfo") or {}
+            management = info.get("managementAddresses") or []
+            management_address = "-"
+            if management and isinstance(management[0], dict):
+                management_address = clean_lldp_value(management[0].get("address"))
+            neighbor_port = clean_lldp_value(neighbor_iface.get("interfaceId_v2") or neighbor_iface.get("interfaceId") or info.get("neighborPort"))
+            row = {
+                "port": iface,
+                "label": short_interface_name(iface),
+                "neighbor": clean_lldp_value(info.get("systemName") or info.get("neighborDevice") or info.get("chassisId")),
+                "neighborPort": neighbor_port,
+                "ttl": str(info.get("ttl") or "-"),
+                "chassisId": clean_lldp_value(info.get("chassisId")),
+                "managementAddress": management_address,
+                "raw": json.dumps(info, ensure_ascii=True, separators=(",", ":"))[:1200],
+            }
+            rows.append(row)
+    return rows
+
+
+def parse_vlans_json(data):
+    rows = []
+    for vlan_id, item in sorted(((data or {}).get("vlans") or {}).items(), key=lambda pair: int(pair[0]) if str(pair[0]).isdigit() else 0):
+        interfaces = item.get("interfaces") or {}
+        rows.append(
+            {
+                "id": str(vlan_id),
+                "name": str(item.get("name") or "-"),
+                "status": str(item.get("status") or "-"),
+                "ports": ", ".join(short_interface_name(name) for name in sorted(interfaces, key=interface_sort_key)),
+            }
+        )
+    return rows
+
+
+def parse_arp_json(data):
+    rows = []
+    for item in (data or {}).get("ipV4Neighbors") or []:
+        rows.append(
+            {
+                "address": str(item.get("address") or "-"),
+                "mac": normalize_mac_display(item.get("hwAddress")),
+                "interface": str(item.get("interface") or "-"),
+                "raw": json.dumps(item, ensure_ascii=True, separators=(",", ":")),
+            }
+        )
+    return rows
+
+
+def normalize_mac_display(value):
+    text = str(value or "-").strip().lower()
+    compact = re.sub(r"[^0-9a-f]", "", text)
+    if len(compact) == 12:
+        return "%s.%s.%s" % (compact[:4], compact[4:8], compact[8:])
+    return text or "-"
+
+
+def parse_fdb_json(data):
+    rows = []
+    tables = []
+    for table_name in ("unicastTable", "multicastTable"):
+        table = ((data or {}).get(table_name) or {}).get("tableEntries") or []
+        tables.extend(table)
+    for item in tables:
+        rows.append(
+            {
+                "vlan": str(item.get("vlanId") or "-"),
+                "mac": normalize_mac_display(item.get("macAddress")),
+                "type": str(item.get("entryType") or "-"),
+                "port": short_interface_name(item.get("interface") or "-"),
+                "raw": json.dumps(item, ensure_ascii=True, separators=(",", ":")),
+            }
+        )
+    return rows
+
+
+def metric_value(value, unit):
+    if value is None:
+        return "-"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return clean_optic_value(value)
+    return ("%g %s" % (number, unit)).strip()
+
+
+def parse_transceivers_json(summary_data, detail_data=None, properties_data=None, inventory_data=None):
+    modules = {}
+    interfaces = (summary_data or {}).get("interfaces") or {}
+    detail_interfaces = (detail_data or {}).get("interfaces") or {}
+    property_interfaces = (properties_data or {}).get("interfaces") or {}
+    for name in sorted(set(list(interfaces.keys()) + list(detail_interfaces.keys()) + list(property_interfaces.keys())), key=interface_sort_key):
+        normalized = normalize_interface(name)
+        if not re.match(r"^Ethernet\d", normalized, re.I):
+            continue
+        item = modules.setdefault(normalized.lower(), blank_transceiver(normalized))
+        summary = interfaces.get(name) or {}
+        detail = detail_interfaces.get(name) or {}
+        props = property_interfaces.get(name) or {}
+        item["type"] = clean_optic_value(summary.get("mediaType") or detail.get("mediaType") or props.get("mediaType"))
+        item["serial"] = clean_optic_value(summary.get("vendorSn") or detail.get("vendorSn") or item.get("serial"))
+        item["temperature"] = metric_value(summary.get("temperature", detail.get("temperature")), "C")
+        item["txPower"] = metric_value(summary.get("txPower", detail.get("txPower")), "dBm")
+        item["rxPower"] = metric_value(summary.get("rxPower", detail.get("rxPower")), "dBm")
+        item["voltage"] = metric_value(summary.get("voltage", detail.get("voltage")), "V")
+        item["current"] = metric_value(summary.get("txBias", detail.get("txBias")), "mA")
+        if summary.get("updateTime") or detail.get("updateTime"):
+            item["lastUpdate"] = format_duration(time.time() - float(summary.get("updateTime") or detail.get("updateTime")))
+        thresholds = (detail.get("details") or {})
+        for metric, label, unit in (
+            ("temperature", "Temperature", "C"),
+            ("voltage", "Voltage", "V"),
+            ("txBias", "Current", "mA"),
+            ("txPower", "TX power", "dBm"),
+            ("rxPower", "RX power", "dBm"),
+        ):
+            threshold = thresholds.get(metric) or {}
+            value = detail.get(metric, summary.get(metric))
+            add_threshold_alert(item, label, value, threshold.get("highAlarm"), threshold.get("highWarn"), threshold.get("lowAlarm"), threshold.get("lowWarn"), unit)
+        item["present"] = transceiver_present(item)
+
+    for slot, inv in ((inventory_data or {}).get("xcvrSlots") or {}).items():
+        normalized = normalize_interface("Ethernet%s" % slot)
+        key = normalized.lower()
+        item = modules.setdefault(key, blank_transceiver(normalized))
+        vendor = clean_optic_value(inv.get("mfgName"))
+        model = clean_optic_value(inv.get("modelName"))
+        serial = clean_optic_value(inv.get("serialNum"))
+        if vendor.lower() == "not present":
+            if not transceiver_present(item):
+                item["present"] = False
+            continue
+        if vendor != "-":
+            item["vendor"] = vendor
+        if model != "-":
+            item["model"] = model
+        if serial != "-":
+            item["serial"] = serial
+        item["present"] = transceiver_present(item)
+
+    for item in modules.values():
+        item["present"] = transceiver_present(item)
+    return modules
+
+
+def parse_protocols_json(ospf_data=None, ospfv3_data=None, bgp_data=None):
+    def bgp_rows(data):
+        rows = []
+        for vrf_name, vrf in ((data or {}).get("vrfs") or {}).items():
+            peers = vrf.get("peers") or {}
+            for peer, item in peers.items():
+                rows.append(
+                    {
+                        "peer": str(peer),
+                        "asn": str(item.get("asn") or item.get("peerAsn") or item.get("remoteAs") or "-"),
+                        "state": str(item.get("peerState") or item.get("state") or item.get("established") or "-"),
+                        "vrf": str(vrf_name),
+                        "raw": json.dumps(item, ensure_ascii=True, separators=(",", ":")),
+                    }
+                )
+        return rows
+
+    def ospf_rows(data):
+        rows = []
+
+        def walk(value):
+            if isinstance(value, dict):
+                if any(key in value for key in ("neighborId", "routerId", "neighborAddress")) and any(key in value for key in ("adjacencyState", "state", "interfaceName")):
+                    rows.append(
+                        {
+                            "neighbor": str(value.get("neighborId") or value.get("routerId") or value.get("neighborAddress") or "-"),
+                            "state": str(value.get("adjacencyState") or value.get("state") or "-"),
+                            "interface": str(value.get("interfaceName") or value.get("interface") or "-"),
+                            "raw": json.dumps(value, ensure_ascii=True, separators=(",", ":")),
+                        }
+                    )
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk((data or {}).get("vrfs") or {})
+        return rows
+
+    return {"ospf": ospf_rows(ospf_data), "ospfv3": ospf_rows(ospfv3_data), "bgp": bgp_rows(bgp_data)}
 
 
 def parse_interfaces(output):
@@ -265,13 +695,45 @@ def enrich_ports(ports, rates, errors, transceivers=None):
 
 def parse_environment(output):
     text = output.lower()
-    has_fault = any(word in text for word in ("fail", "fault", "bad", "overheat"))
-    temp_match = re.search(r"(\d+)\s*(?:c|degrees)", output, re.I)
-    temperature = int(temp_match.group(1)) if temp_match else (58 if has_fault else 40)
+    temperatures = []
+    ambient = re.search(r"Ambient temperature:\s*(-?\d+(?:\.\d+)?)\s*C", output, re.I)
+    if ambient:
+        temperatures.append(float(ambient.group(1)))
+    for line in output.splitlines():
+        match = re.match(r"^\s*\d+\s+.+?\s+(-?\d+(?:\.\d+)?)\s+(?:\(|N/A|[-\d])", line)
+        if match:
+            value = float(match.group(1))
+            if value > 0:
+                temperatures.append(value)
+    temperature = round(max(temperatures)) if temperatures else 40
+
+    temp_status = re.search(r"System temperature status is:\s*([A-Za-z]+)", output, re.I)
+    cooling_status = re.search(r"System cooling status is:\s*([A-Za-z]+)", output, re.I)
+    fan_status = "OK"
+    if cooling_status and cooling_status.group(1).lower() != "ok":
+        fan_status = "CHECK"
+    elif not cooling_status and re.search(r"^\s*(?:\d+/\d+|PowerSupply\d+/\d+)\s+(?!Ok\b)\S+", output, re.I | re.M):
+        fan_status = "CHECK"
+
+    psu_statuses = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if len(tokens) >= 7 and tokens[0].isdigit() and re.match(r"^PWR|^PSU", tokens[1], re.I):
+            status = " ".join(tokens[6:])
+            status = re.sub(r"\s+\d+:\d+:\d+$", "", status).strip().lower()
+            if status and not re.search(r"\b(not present|not inserted|absent|empty)\b", status):
+                psu_statuses.append(status)
+    psu_ok = any(status == "ok" for status in psu_statuses)
+    psu_fault = any(re.search(r"\b(fail|fault|bad|error|overheat|power loss|offline)\b", status) for status in psu_statuses)
+    psu_redundancy_lost = len(psu_statuses) > 1 and any(status != "ok" for status in psu_statuses)
+    psu_status = "CHECK" if psu_fault or psu_redundancy_lost or (psu_statuses and not psu_ok) else "OK"
+
+    if temp_status and temp_status.group(1).lower() != "ok":
+        fan_status = "CHECK"
     return {
         "temperature": temperature,
-        "fanStatus": "CHECK" if has_fault else "OK",
-        "psuStatus": "CHECK" if has_fault else "OK",
+        "fanStatus": fan_status,
+        "psuStatus": psu_status,
     }
 
 
@@ -376,27 +838,130 @@ def update_history(ports, traffic):
     return history
 
 
-def parse_lldp_neighbors(output):
+def compact_history(history, limit=80, include_ports=True):
+    if not isinstance(history, dict):
+        return {"traffic": [], "ports": {}}
+    ports = history.get("ports") if isinstance(history.get("ports"), dict) else {}
+    return {
+        "traffic": list(history.get("traffic") or [])[-limit:],
+        "ports": {name: list(series or [])[-limit:] for name, series in ports.items()} if include_ports else {},
+    }
+
+
+def clean_lldp_value(value):
+    return str(value or "").strip().strip('"') or "-"
+
+
+def short_interface_name(name):
+    normalized = normalize_interface(name)
+    match = re.match(r"^Ethernet(.+)$", normalized, re.I)
+    if match:
+        return "Et%s" % match.group(1)
+    if re.match(r"^Management(\d+)$", normalized, re.I):
+        return re.sub(r"^Management", "Ma", normalized, flags=re.I)
+    return normalized
+
+
+def parse_lldp_detail(output):
     neighbors = []
+    current_port = None
+    current = None
+
+    def finish():
+        if not current:
+            return
+        if current.get("neighbor") == "-" and current.get("chassisId") != "-":
+            current["neighbor"] = current["chassisId"]
+        current["raw"] = "\n".join(current.pop("_raw", []))
+        neighbors.append(current)
+
     for line in output.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.lower().startswith(("port", "----")):
+        interface = re.match(r"^Interface\s+(\S+)\s+detected\s+\d+\s+LLDP neighbors", stripped, re.I)
+        if interface:
+            finish()
+            current = None
+            current_port = normalize_interface(interface.group(1))
             continue
-        if not re.match(r"^(Et|Ethernet|Ma)\S+", stripped, re.I):
+        if not current_port:
             continue
-        tokens = stripped.split()
-        if len(tokens) < 2:
+        neighbor = re.match(r"^Neighbor\s+(.+?),\s+age\s+(.+)$", stripped, re.I)
+        if neighbor:
+            finish()
+            current = {
+                "port": current_port,
+                "label": short_interface_name(current_port),
+                "neighbor": "-",
+                "neighborPort": "-",
+                "ttl": "-",
+                "chassisId": "-",
+                "managementAddress": "-",
+                "_raw": [stripped],
+            }
+            descriptor = clean_lldp_value(neighbor.group(1))
+            if descriptor != "-":
+                current["neighbor"] = descriptor
             continue
-        port = tokens[0]
-        neighbor = tokens[1]
-        ttl = tokens[-1] if tokens[-1].isdigit() else "-"
-        neighbor_port = tokens[-2] if len(tokens) > 3 else "-"
+        if not current:
+            continue
+        current["_raw"].append(stripped)
+        fields = {
+            "chassisId": r"^-?\s*Chassis ID\s*:\s*(.+)$",
+            "neighborPort": r"^-?\s*Port ID\s*:\s*(.+)$",
+            "neighbor": r"^-?\s*System Name:\s*(.+)$",
+            "managementAddress": r"^-?\s*Management Address\s*:\s*(.+)$",
+        }
+        for key, pattern in fields.items():
+            match = re.match(pattern, stripped, re.I)
+            if match:
+                current[key] = clean_lldp_value(match.group(1))
+        ttl = re.match(r"^-?\s*Time To Live:\s*(\d+)", stripped, re.I)
+        if ttl:
+            current["ttl"] = ttl.group(1)
+    finish()
+    return neighbors
+
+
+def parse_lldp_neighbors(output, detail_output=""):
+    detail_neighbors = parse_lldp_detail(detail_output)
+    if detail_neighbors:
+        return detail_neighbors
+
+    neighbors = []
+    neighbor_start = None
+    neighbor_port_start = None
+    ttl_start = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith("port") and "neighbor device id" in lower:
+            neighbor_start = line.lower().find("neighbor device id")
+            neighbor_port_start = line.lower().find("neighbor port id")
+            ttl_start = line.lower().find("ttl")
+            continue
+        if not stripped or lower.startswith(("last table", "number of", "port", "----")):
+            continue
+        if not re.match(r"^(Et|Ethernet|Ma|Management)\S+", stripped, re.I):
+            continue
+        if neighbor_start is not None and neighbor_port_start is not None and ttl_start is not None:
+            port = line[:neighbor_start].strip()
+            neighbor = line[neighbor_start:neighbor_port_start].strip()
+            neighbor_port = line[neighbor_port_start:ttl_start].strip()
+            ttl = line[ttl_start:].strip().split()[0] if line[ttl_start:].strip() else "-"
+        else:
+            tokens = stripped.split()
+            if len(tokens) < 2:
+                continue
+            port = tokens[0]
+            ttl = tokens[-1] if tokens[-1].isdigit() else "-"
+            neighbor_port = tokens[-2] if len(tokens) > 3 else "-"
+            neighbor = " ".join(tokens[1:-2]) if len(tokens) > 3 else tokens[1]
         neighbors.append(
             {
                 "port": normalize_interface(port),
                 "label": port,
-                "neighbor": neighbor,
-                "neighborPort": neighbor_port,
+                "neighbor": clean_lldp_value(neighbor),
+                "neighborPort": clean_lldp_value(neighbor_port),
                 "ttl": ttl,
                 "raw": stripped,
             }
@@ -446,19 +1011,174 @@ def parse_fdb(output):
         if not mac:
             continue
         tokens = stripped.split()
+        mac_index = next((i for i, token in enumerate(tokens) if re.match(r"[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}", token, re.I)), -1)
+        entry_type = tokens[mac_index + 1] if mac_index >= 0 and len(tokens) > mac_index + 1 else "-"
+        port = tokens[mac_index + 2] if mac_index >= 0 and len(tokens) > mac_index + 2 else "-"
         rows.append(
             {
-                "vlan": tokens[0] if tokens else "-",
+                "vlan": tokens[mac_index - 1] if mac_index > 0 else (tokens[0] if tokens else "-"),
                 "mac": mac.group(0),
-                "type": next((token for token in tokens if token.lower() in ("dynamic", "static", "learned")), "-"),
-                "port": tokens[-1] if tokens else "-",
+                "type": entry_type if entry_type.lower() in ("dynamic", "static", "learned", "multicast", "cpu") else next((token for token in tokens if token.lower() in ("dynamic", "static", "learned")), "-"),
+                "port": port,
                 "raw": stripped,
             }
         )
     return rows
 
 
-def parse_transceivers(summary_output, detail_output=""):
+def clean_optic_value(value):
+    value = str(value or "").replace("\x00", "").strip().strip('"')
+    if not value or value.upper() in ("N/A", "NA", "NONE", "NOT PRESENT"):
+        return "-"
+    return value
+
+
+def optic_value_with_unit(value, unit):
+    value = clean_optic_value(value)
+    if value == "-":
+        return "-"
+    if re.search(r"[A-Za-z%]", value):
+        return value
+    return "%s %s" % (value, unit)
+
+
+def optic_number(value):
+    value = clean_optic_value(value)
+    if value == "-":
+        return None
+    match = re.search(r"-?\d+(?:\.\d+)?", value)
+    return float(match.group(0)) if match else None
+
+
+def blank_transceiver(name):
+    return {
+        "interface": name,
+        "present": False,
+        "type": "-",
+        "vendor": "-",
+        "model": "-",
+        "serial": "-",
+        "temperature": "-",
+        "txPower": "-",
+        "rxPower": "-",
+        "alerts": [],
+        "raw": "",
+    }
+
+
+def transceiver_present(item):
+    return any(clean_optic_value(item.get(key)) != "-" for key in ("type", "vendor", "model", "serial", "temperature", "txPower", "rxPower"))
+
+
+def parse_transceiver_csv(output, modules):
+    try:
+        reader = csv.DictReader(io.StringIO(output))
+    except Exception:
+        return
+    for row in reader:
+        port = row.get("Port (Interface Name)") or row.get("Port") or row.get("Interface")
+        if not port:
+            continue
+        name = normalize_interface(port.strip())
+        key = name.lower()
+        item = modules.setdefault(key, blank_transceiver(name))
+        media = clean_optic_value(row.get("Media type"))
+        serial = clean_optic_value(row.get("Xcvr Serial Number"))
+        if media != "-":
+            item["type"] = media
+        if serial != "-":
+            item["serial"] = serial
+        item["temperature"] = optic_value_with_unit(row.get("Temperature (Celsius)"), "C")
+        item["txPower"] = optic_value_with_unit(row.get("Tx Power (dBm)"), "dBm")
+        item["rxPower"] = optic_value_with_unit(row.get("Rx Power (dBm)"), "dBm")
+        voltage = optic_value_with_unit(row.get("Voltage (Volts)"), "V")
+        current = optic_value_with_unit(row.get("Current (mA)"), "mA")
+        if voltage != "-":
+            item["voltage"] = voltage
+        if current != "-":
+            item["current"] = current
+        last_update = clean_optic_value(row.get("Last Update"))
+        if last_update != "-":
+            item["lastUpdate"] = last_update
+        item["present"] = transceiver_present(item)
+
+
+def parse_transceiver_properties(output, modules):
+    current = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        match = re.match(r"^Name:\s*(\S+)", stripped, re.I)
+        if match:
+            name = normalize_interface(match.group(1))
+            if not re.match(r"^Ethernet\d", name, re.I):
+                current = None
+                continue
+            current = name.lower()
+            modules.setdefault(current, blank_transceiver(name))
+            continue
+        if not current or current not in modules:
+            continue
+        media = re.match(r"^Media type:\s*(.+)$", stripped, re.I)
+        if media:
+            value = clean_optic_value(media.group(1))
+            if value == "-":
+                modules[current]["present"] = False
+            else:
+                modules[current]["type"] = value
+                modules[current]["present"] = True
+
+
+def parse_transceiver_inventory(output, modules):
+    in_slots = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if re.match(r"^system has \d+ switched transceiver slots", lower):
+            in_slots = True
+            continue
+        if in_slots and (not stripped or lower.startswith("system has ")):
+            in_slots = False
+        if not in_slots or not re.match(r"^\d+\s+", stripped):
+            continue
+        tokens = stripped.split()
+        port = tokens[0]
+        name = normalize_interface("Et%s" % port)
+        key = name.lower()
+        item = modules.setdefault(key, blank_transceiver(name))
+        if "not present" in lower:
+            item["present"] = False
+            continue
+        if len(tokens) >= 4:
+            item["vendor"] = clean_optic_value(tokens[1])
+            item["model"] = clean_optic_value(tokens[2])
+            item["serial"] = clean_optic_value(tokens[3])
+            item["present"] = True
+
+
+def add_threshold_alert(item, label, value, high_alarm, high_warn, low_alarm, low_warn, unit):
+    reading = optic_number(value)
+    if reading is None:
+        return
+    thresholds = {
+        "high alarm": optic_number(high_alarm),
+        "high warning": optic_number(high_warn),
+        "low alarm": optic_number(low_alarm),
+        "low warning": optic_number(low_warn),
+    }
+    alert = None
+    if thresholds["high alarm"] is not None and reading >= thresholds["high alarm"]:
+        alert = "%s high alarm: %s %s >= %s %s" % (label, reading, unit, thresholds["high alarm"], unit)
+    elif thresholds["high warning"] is not None and reading >= thresholds["high warning"]:
+        alert = "%s high warning: %s %s >= %s %s" % (label, reading, unit, thresholds["high warning"], unit)
+    elif thresholds["low alarm"] is not None and reading <= thresholds["low alarm"]:
+        alert = "%s low alarm: %s %s <= %s %s" % (label, reading, unit, thresholds["low alarm"], unit)
+    elif thresholds["low warning"] is not None and reading <= thresholds["low warning"]:
+        alert = "%s low warning: %s %s <= %s %s" % (label, reading, unit, thresholds["low warning"], unit)
+    if alert and alert not in item["alerts"]:
+        item["alerts"].append(alert)
+
+
+def parse_transceivers(summary_output, detail_output="", csv_output="", properties_output="", inventory_output=""):
     modules = {}
     for line in summary_output.splitlines():
         stripped = line.strip()
@@ -467,47 +1187,62 @@ def parse_transceivers(summary_output, detail_output=""):
         tokens = stripped.split()
         name = normalize_interface(tokens[0])
         raw_tail = " ".join(tokens[1:])
-        present = "not present" not in raw_tail.lower() and "not-present" not in raw_tail.lower()
-        modules[name.lower()] = {
-            "interface": name,
-            "present": present,
-            "type": raw_tail or "-",
-            "vendor": "-",
-            "model": "-",
-            "serial": "-",
-            "temperature": "-",
-            "txPower": "-",
-            "rxPower": "-",
-            "alerts": [],
-            "raw": stripped,
-        }
+        item = modules.setdefault(name.lower(), blank_transceiver(name))
+        item["raw"] = stripped
+        lower_tail = raw_tail.lower()
+        dom_row = len(tokens) >= 6 and all(re.match(r"^(?:N/A|NA|-?\d+(?:\.\d+)?)$", token, re.I) for token in tokens[1:6])
+        if "not present" in lower_tail or "not-present" in lower_tail:
+            item["present"] = False
+        elif dom_row:
+            item["temperature"] = optic_value_with_unit(tokens[1], "C")
+            item["txPower"] = optic_value_with_unit(tokens[4], "dBm")
+            item["rxPower"] = optic_value_with_unit(tokens[5], "dBm")
+            item["present"] = transceiver_present(item)
+        elif raw_tail:
+            item["type"] = clean_optic_value(raw_tail)
+            item["present"] = transceiver_present(item)
+
+    parse_transceiver_csv(csv_output, modules)
+    parse_transceiver_properties(properties_output, modules)
+    parse_transceiver_inventory(inventory_output, modules)
 
     current = None
+    detail_metric = None
+    detail_label = None
+    detail_unit = ""
     for line in detail_output.splitlines():
         stripped = line.strip()
+        lower = stripped.lower()
+        if "temperature" in lower and "threshold" in lower:
+            detail_metric, detail_label, detail_unit = "temperature", "Temperature", "C"
+            continue
+        if "voltage" in lower and "threshold" in lower:
+            detail_metric, detail_label, detail_unit = "voltage", "Voltage", "V"
+            continue
+        if "current" in lower and "threshold" in lower:
+            detail_metric, detail_label, detail_unit = "current", "Current", "mA"
+            continue
+        if "tx power" in lower and "threshold" in lower:
+            detail_metric, detail_label, detail_unit = "txPower", "TX power", "dBm"
+            continue
+        if "rx power" in lower and "threshold" in lower:
+            detail_metric, detail_label, detail_unit = "rxPower", "RX power", "dBm"
+            continue
+        if not stripped or stripped.startswith("---") or stripped.lower().startswith(("port ", "high alarm")):
+            continue
         header = re.match(r"^(Et|Ethernet)\d+(?:/\d+)?\b", stripped, re.I)
         if header:
             current = normalize_interface(header.group(0)).lower()
-            modules.setdefault(
-                current,
-                {
-                    "interface": normalize_interface(header.group(0)),
-                    "present": True,
-                    "type": "-",
-                    "vendor": "-",
-                    "model": "-",
-                    "serial": "-",
-                    "temperature": "-",
-                    "txPower": "-",
-                    "rxPower": "-",
-                    "alerts": [],
-                    "raw": stripped,
-                },
-            )
+            item = modules.setdefault(current, blank_transceiver(normalize_interface(header.group(0))))
+            row_tokens = stripped.split()
+            if detail_metric and len(row_tokens) >= 6:
+                item[detail_metric] = optic_value_with_unit(row_tokens[1], detail_unit)
+                item["present"] = transceiver_present(item)
+                add_threshold_alert(item, detail_label, row_tokens[1], row_tokens[2], row_tokens[3], row_tokens[4], row_tokens[5], detail_unit)
+                continue
         if not current or current not in modules:
             continue
         item = modules[current]
-        lower = stripped.lower()
         if "not present" in lower:
             item["present"] = False
         for key, patterns in {
@@ -522,11 +1257,15 @@ def parse_transceivers(summary_output, detail_output=""):
             for pattern in patterns:
                 match = re.search(pattern, stripped, re.I)
                 if match:
-                    item[key] = match.group(1).strip()
+                    item[key] = clean_optic_value(match.group(1))
                     break
-        if any(word in lower for word in ("alarm", "warning", "fault", "high", "low")):
+        if any(word in lower for word in ("alarm", "warning", "fault")) and "threshold" not in lower:
             item["alerts"].append(stripped)
 
+    for item in modules.values():
+        item["present"] = transceiver_present(item)
+        if item["present"] is False:
+            item["type"] = clean_optic_value(item.get("type"))
     return modules
 
 
@@ -740,7 +1479,25 @@ def config_diff(before, after):
     )
 
 
-def collect_state():
+def merge_state(base, update):
+    if not base:
+        merged = dict(update)
+    else:
+        merged = dict(base)
+        for key, value in update.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                child = dict(merged[key])
+                child.update(value)
+                merged[key] = child
+            else:
+                merged[key] = value
+    if merged.get("ports") and merged.get("transceivers"):
+        optics = {str(item.get("interface") or "").lower(): item for item in merged.get("transceivers", [])}
+        merged["ports"] = [dict(port, transceiver=optics.get(str(port.get("name") or "").lower(), port.get("transceiver") or {})) for port in merged.get("ports", [])]
+    return merged
+
+
+def collect_state_cli_legacy(scope="full"):
     errors = []
 
     def get(command):
@@ -756,6 +1513,80 @@ def collect_state():
         except Exception:
             return ""
 
+    scope = str(scope or "full").lower()
+    if scope == "core":
+        version_output = get("show version")
+        hostname_output = get("show hostname")
+        uptime_output = get("show uptime")
+        interface_output = get("show interfaces status")
+        rates_output = get("show interfaces counters rates")
+        errors_output = get("show interfaces counters errors")
+        top_output = get("show processes top once")
+        env_output = get_optional("show system environment all") or get_optional("show environment all")
+        lldp_output = get_optional("show lldp neighbors")
+
+        eos_version, serial = parse_version(version_output)
+        ports = enrich_ports(parse_interfaces(interface_output), parse_interface_rates(rates_output), parse_interface_errors(errors_output), {})
+        traffic = traffic_summary(ports)
+        history = update_history(ports, traffic)
+        health = parse_system_health(top_output, env_output, version_output)
+        alerts = build_alerts(ports, health, env_output, errors)
+        return {
+            "device": {
+                "model": MODEL,
+                "hostname": parse_hostname(hostname_output),
+                "serial": serial,
+                "eosVersion": eos_version,
+                "uptime": uptime_output.strip() or "-",
+                "switchingCapacity": traffic["throughputLabel"],
+                "forwardingRate": traffic["packetRateLabel"],
+                "airflow": "Front-to-back",
+                "lastRefresh": now_ms(),
+                "source": "on-box",
+            },
+            "health": health,
+            "traffic": traffic,
+            "history": compact_history(history, limit=40, include_ports=False),
+            "ports": ports,
+            "lldp": parse_lldp_neighbors(lldp_output),
+            "alerts": alerts,
+            "events": [{"time": now_ms(), "level": "error" if errors else "info", "message": "; ".join(errors[:4]) if errors else "核心状态已刷新"}],
+            "loading": {"core": "done", "tables": "pending", "optics": "pending", "protocols": "pending", "extras": "pending"},
+        }
+
+    if scope == "tables":
+        vlan_output = get("show vlan brief")
+        arp_output = get("show arp")
+        fdb_output = get("show mac address-table")
+        return {"vlans": parse_vlans(vlan_output), "arp": parse_arp(arp_output), "fdb": parse_fdb(fdb_output), "loading": {"tables": "done"}}
+
+    if scope == "optics":
+        transceiver_output = get("show interfaces transceiver")
+        transceiver_detail_output = get("show interfaces transceiver detail")
+        transceiver_csv_output = get_optional("show interfaces transceiver csv")
+        transceiver_properties_output = get_optional("show interfaces transceiver properties")
+        inventory_output = get_optional("show inventory")
+        transceivers = parse_transceivers(transceiver_output, transceiver_detail_output, transceiver_csv_output, transceiver_properties_output, inventory_output)
+        return {"transceivers": list(transceivers.values()), "loading": {"optics": "done"}}
+
+    if scope == "protocols":
+        ospf_output = get_optional("show ip ospf neighbor")
+        ospfv3_output = get_optional("show ipv6 ospf neighbor")
+        bgp_output = get_optional("show ip bgp summary")
+        return {
+            "protocols": {
+                "ospf": parse_protocol_rows(ospf_output, "ospf"),
+                "ospfv3": parse_protocol_rows(ospfv3_output, "ospfv3"),
+                "bgp": parse_protocol_rows(bgp_output, "bgp"),
+            },
+            "loading": {"protocols": "done"},
+        }
+
+    if scope == "extras":
+        poe_output = get_optional("show poe interface")
+        integration_output = get_optional("show running-config | include logging host|sflow|netflow|ip flow|flow exporter|flow monitor")
+        return {"poe": parse_poe(poe_output), "integrations": parse_integrations(integration_output), "loading": {"extras": "done"}}
+
     version_output = get("show version")
     hostname_output = get("show hostname")
     uptime_output = get("show uptime")
@@ -764,10 +1595,14 @@ def collect_state():
     errors_output = get("show interfaces counters errors")
     transceiver_output = get("show interfaces transceiver")
     transceiver_detail_output = get("show interfaces transceiver detail")
+    transceiver_csv_output = get_optional("show interfaces transceiver csv")
+    transceiver_properties_output = get_optional("show interfaces transceiver properties")
+    inventory_output = get_optional("show inventory")
     poe_output = get_optional("show poe interface")
     top_output = get("show processes top once")
-    env_output = get("show environment all")
+    env_output = get_optional("show system environment all") or get_optional("show environment all")
     lldp_output = get("show lldp neighbors")
+    lldp_detail_output = get_optional("show lldp neighbors detail")
     vlan_output = get("show vlan brief")
     arp_output = get("show arp")
     fdb_output = get("show mac address-table")
@@ -777,7 +1612,7 @@ def collect_state():
     integration_output = get("show running-config | include logging host|sflow|netflow|ip flow|flow exporter|flow monitor")
 
     eos_version, serial = parse_version(version_output)
-    transceivers = parse_transceivers(transceiver_output, transceiver_detail_output)
+    transceivers = parse_transceivers(transceiver_output, transceiver_detail_output, transceiver_csv_output, transceiver_properties_output, inventory_output)
     ports = enrich_ports(parse_interfaces(interface_output), parse_interface_rates(rates_output), parse_interface_errors(errors_output), transceivers)
     traffic = traffic_summary(ports)
     history = update_history(ports, traffic)
@@ -798,11 +1633,11 @@ def collect_state():
         },
         "health": health,
         "traffic": traffic,
-        "history": history,
+        "history": compact_history(history),
         "ports": ports,
         "transceivers": list(transceivers.values()),
         "poe": parse_poe(poe_output),
-        "lldp": parse_lldp_neighbors(lldp_output),
+        "lldp": parse_lldp_neighbors(lldp_output, lldp_detail_output),
         "vlans": parse_vlans(vlan_output),
         "arp": parse_arp(arp_output),
         "fdb": parse_fdb(fdb_output),
@@ -820,7 +1655,162 @@ def collect_state():
                 "message": "; ".join(errors) if errors else ("Active alerts: %s" % len(alerts) if alerts else "Refreshed from local EOS CLI."),
             }
         ],
+        "loading": {"core": "done", "tables": "done", "optics": "done", "protocols": "done", "extras": "done"},
     }
+
+
+def collect_state(scope="full"):
+    errors = []
+
+    def get(command, optional=False, timeout=22):
+        try:
+            return run_read_command(command, timeout=timeout)
+        except Exception as exc:
+            if not optional:
+                errors.append("%s: %s" % (command, exc))
+            return ""
+
+    def get_optional(command):
+        return get(command, optional=True)
+
+    def jsons(commands):
+        return run_eapi_json_map(commands)
+
+    def has_data(data):
+        return isinstance(data, dict) and bool(data)
+
+    scope = str(scope or "full").lower()
+    if scope == "core":
+        commands = [
+            "show version",
+            "show hostname",
+            "show uptime",
+            "show interfaces status",
+            "show interfaces counters rates",
+            "show interfaces counters errors",
+            "show processes top once",
+            "show lldp neighbors detail",
+        ]
+        data = jsons(commands)
+        version_data = data.get("show version") or {}
+        hostname_data = data.get("show hostname") or {}
+        uptime_data = data.get("show uptime") or {}
+        interface_data = data.get("show interfaces status") or {}
+        rates_data = data.get("show interfaces counters rates") or {}
+        errors_data = data.get("show interfaces counters errors") or {}
+        top_data = data.get("show processes top once") or {}
+        lldp_data = data.get("show lldp neighbors detail") or {}
+
+        version_output = "" if has_data(version_data) else get("show version")
+        hostname_output = "" if has_data(hostname_data) else get("show hostname")
+        uptime_output = "" if has_data(uptime_data) else get("show uptime")
+        interface_output = "" if has_data(interface_data) else get("show interfaces status")
+        rates_output = "" if has_data(rates_data) else get("show interfaces counters rates")
+        errors_output = "" if has_data(errors_data) else get("show interfaces counters errors")
+        top_output = "" if has_data(top_data) else get("show processes top once")
+        env_output = get_optional("show system environment all") or get_optional("show environment all")
+        lldp_output = "" if has_data(lldp_data) else get_optional("show lldp neighbors")
+
+        eos_version, serial = parse_version_json(version_data) if has_data(version_data) else parse_version(version_output)
+        ports = enrich_ports(
+            parse_interfaces_json(interface_data) if has_data(interface_data) else parse_interfaces(interface_output),
+            parse_interface_rates_json(rates_data) if has_data(rates_data) else parse_interface_rates(rates_output),
+            parse_interface_errors_json(errors_data) if has_data(errors_data) else parse_interface_errors(errors_output),
+            {},
+        )
+        traffic = traffic_summary(ports)
+        history = update_history(ports, traffic)
+        health = parse_system_health_json(top_data, env_output, version_data) if has_data(top_data) else parse_system_health(top_output, env_output, version_output)
+        alerts = build_alerts(ports, health, env_output, errors)
+        uptime = format_duration(uptime_data.get("upTime") or version_data.get("uptime")) if has_data(uptime_data) or has_data(version_data) else (uptime_output.strip() or "-")
+        hostname = (hostname_data.get("hostname") or hostname_data.get("fqdn")) if has_data(hostname_data) else parse_hostname(hostname_output)
+        return {
+            "device": {
+                "model": version_data.get("modelName") or MODEL,
+                "hostname": hostname,
+                "serial": serial,
+                "eosVersion": eos_version,
+                "uptime": uptime,
+                "switchingCapacity": traffic["throughputLabel"],
+                "forwardingRate": traffic["packetRateLabel"],
+                "airflow": "Front-to-back",
+                "lastRefresh": now_ms(),
+                "source": "eAPI + CLI fallback",
+            },
+            "health": health,
+            "traffic": traffic,
+            "history": compact_history(history, limit=40, include_ports=False),
+            "ports": ports,
+            "lldp": parse_lldp_json(lldp_data) if has_data(lldp_data) else parse_lldp_neighbors(lldp_output),
+            "alerts": alerts,
+            "events": [{"time": now_ms(), "level": "error" if errors else "info", "message": "; ".join(errors[:4]) if errors else "Core state refreshed via eAPI."}],
+            "loading": {"core": "done", "tables": "pending", "optics": "pending", "protocols": "pending", "extras": "pending"},
+        }
+
+    if scope == "tables":
+        commands = ["show vlan brief", "show arp", "show mac address-table"]
+        data = jsons(commands)
+        vlan_data = data.get("show vlan brief") or {}
+        arp_data = data.get("show arp") or {}
+        fdb_data = data.get("show mac address-table") or {}
+        return {
+            "vlans": parse_vlans_json(vlan_data) if has_data(vlan_data) else parse_vlans(get("show vlan brief")),
+            "arp": parse_arp_json(arp_data) if has_data(arp_data) else parse_arp(get("show arp")),
+            "fdb": parse_fdb_json(fdb_data) if has_data(fdb_data) else parse_fdb(get("show mac address-table")),
+            "loading": {"tables": "done"},
+        }
+
+    if scope == "optics":
+        commands = ["show interfaces transceiver", "show interfaces transceiver detail", "show interfaces transceiver properties", "show inventory"]
+        data = jsons(commands)
+        if any(has_data(data.get(command)) for command in commands):
+            transceivers = parse_transceivers_json(
+                data.get("show interfaces transceiver") or {},
+                data.get("show interfaces transceiver detail") or {},
+                data.get("show interfaces transceiver properties") or {},
+                data.get("show inventory") or {},
+            )
+        else:
+            transceiver_output = get("show interfaces transceiver")
+            transceiver_detail_output = get("show interfaces transceiver detail")
+            transceiver_csv_output = get_optional("show interfaces transceiver csv")
+            transceiver_properties_output = get_optional("show interfaces transceiver properties")
+            inventory_output = get_optional("show inventory")
+            transceivers = parse_transceivers(transceiver_output, transceiver_detail_output, transceiver_csv_output, transceiver_properties_output, inventory_output)
+        return {"transceivers": list(transceivers.values()), "loading": {"optics": "done"}}
+
+    if scope == "protocols":
+        commands = ["show ip ospf neighbor", "show ipv6 ospf neighbor", "show ip bgp summary"]
+        data = jsons(commands)
+        if any(has_data(data.get(command)) for command in commands):
+            protocols = parse_protocols_json(data.get("show ip ospf neighbor"), data.get("show ipv6 ospf neighbor"), data.get("show ip bgp summary"))
+        else:
+            ospf_output = get_optional("show ip ospf neighbor")
+            ospfv3_output = get_optional("show ipv6 ospf neighbor")
+            bgp_output = get_optional("show ip bgp summary")
+            protocols = {
+                "ospf": parse_protocol_rows(ospf_output, "ospf"),
+                "ospfv3": parse_protocol_rows(ospfv3_output, "ospfv3"),
+                "bgp": parse_protocol_rows(bgp_output, "bgp"),
+            }
+        return {"protocols": protocols, "loading": {"protocols": "done"}}
+
+    if scope == "extras":
+        poe_data = (jsons(["show poe interface"]).get("show poe interface") or {})
+        poe_output = "" if has_data(poe_data) else get_optional("show poe interface")
+        integration_output = get_optional("show running-config | include logging host|sflow|netflow|ip flow|flow exporter|flow monitor")
+        return {"poe": parse_poe(poe_output), "integrations": parse_integrations(integration_output), "loading": {"extras": "done"}}
+
+    state = collect_state("core")
+    for child_scope in ("tables", "extras", "optics", "protocols"):
+        state = merge_state(state, collect_state(child_scope))
+    state["history"] = compact_history(read_json_file(HISTORY_FILE, {"traffic": [], "ports": {}}))
+    state["loading"] = {"core": "done", "tables": "done", "optics": "done", "protocols": "done", "extras": "done"}
+    if state.get("alerts"):
+        state["events"] = [{"time": now_ms(), "level": "warning", "message": "Active alerts: %s" % len(state.get("alerts", []))}]
+    else:
+        state["events"] = [{"time": now_ms(), "level": "success", "message": "Refreshed via eAPI with CLI fallback."}]
+    return state
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -870,9 +1860,9 @@ INDEX_HTML = r"""<!doctype html>
     const historyData=[];function drawSingleChart(c,values,color){if(!c)return;const ctx=c.getContext("2d"),w=c.width,h=c.height,max=Math.max(1,...values);ctx.clearRect(0,0,w,h);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=20;y<h;y+=25){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();values.forEach((v,i)=>{const x=i*(w/Math.max(1,values.length-1)),y=h-12-(v/max)*(h-24);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}function drawChart(t){historyData.push(Number(t.totalMbps||0));while(historyData.length>40)historyData.shift();drawSingleChart(el.trafficChart,historyData,"#0f766e");drawSingleChart(el.trafficChart2,historyData,"#0f766e");el.chartLabel.textContent=`${Number(t.totalMbps||0).toFixed(2)} Mbps / ${Number(t.totalKpps||0).toFixed(2)} Kpps`}function drawPortChart(name){const c=$("#portLineChart"),h=portHistory[name]||[];if(!c||!h.length)return;const rx=h.map(x=>x.rx),tx=h.map(x=>x.tx),ctx=c.getContext("2d"),w=c.width,ht=c.height,max=Math.max(1,...rx,...tx);ctx.clearRect(0,0,w,ht);ctx.strokeStyle=getComputedStyle(document.body).getPropertyValue("--line").trim();ctx.beginPath();for(let y=24;y<ht;y+=34){ctx.moveTo(0,y);ctx.lineTo(w,y)}ctx.stroke();function line(vals,color){ctx.strokeStyle=color;ctx.lineWidth=2;ctx.beginPath();vals.forEach((v,i)=>{const x=i*(w/Math.max(1,vals.length-1)),y=ht-18-(v/max)*(ht-36);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke()}line(rx,"#2563eb");line(tx,"#0f766e");ctx.fillStyle=getComputedStyle(document.body).getPropertyValue("--muted").trim();ctx.fillText("RX blue / TX green",10,14)}
     function rows(headers,items,map){return `<thead><tr>${headers.map(h=>`<th>${h}</th>`).join("")}</tr></thead><tbody>${items.map(item=>`<tr>${map(item).map(v=>`<td>${esc(v)}</td>`).join("")}</tr>`).join("")}</tbody>`}function renderExtra(state){const alerts=state.alerts||[];el.alertList.innerHTML=alerts.length?alerts.map(a=>`<li data-severity="${esc(a.severity)}"><b>${esc(a.title)}</b>${esc(a.message)}</li>`).join(""):"<li>暂无告警</li>";el.lldpList.innerHTML=(state.lldp||[]).length?(state.lldp||[]).map(n=>`<li><b>${esc(n.label)}</b> → ${esc(n.neighbor)} / ${esc(n.neighborPort)}</li>`).join(""):"<li>未发现 LLDP 邻居</li>";const proto=[...(state.protocols?.ospf||[]).map(x=>({type:"OSPF",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.ospfv3||[]).map(x=>({type:"OSPFv3",a:x.neighbor,b:x.state,c:x.interface})),...(state.protocols?.bgp||[]).map(x=>({type:"BGP",a:x.peer,b:x.state,c:x.asn}))];el.protocolTable.innerHTML=rows(["协议","对象","状态","接口/AS"],proto,x=>[x.type,x.a,x.b,x.c]);const tableItems=[...(state.vlans||[]).slice(0,40).map(x=>({type:"VLAN",a:x.id,b:x.name,c:x.status,d:x.ports})),...(state.arp||[]).slice(0,40).map(x=>({type:"ARP",a:x.address,b:x.mac,c:x.interface,d:""})),...(state.fdb||[]).slice(0,40).map(x=>({type:"FDB",a:x.vlan,b:x.mac,c:x.type,d:x.port}))];el.tablesView.innerHTML=rows(["类型","键","值","状态","端口"],tableItems,x=>[x.type,x.a,x.b,x.c,x.d]);const optics=(state.transceivers||[]).filter(x=>x.present!==false).slice(0,96);el.transceiverTable.innerHTML=optics.length?rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],optics,x=>[x.interface,x.type,x.vendor,x.model,x.serial,x.temperature,`${x.txPower||"-"} / ${x.rxPower||"-"}`,(x.alerts||[]).join("; ")]):rows(["接口","类型","厂商","型号","序列号","温度","TX/RX","告警"],[],x=>[]);const poe=state.poe||{},poeRows=poe.ports||[];el.poeTable.innerHTML=poeRows.length?rows(["接口","Admin","状态","功率","原始行"],poeRows,x=>[x.interface,x.admin,x.state,x.watts,x.raw]):rows(["接口","Admin","状态","功率","原始行"],[{interface:"-",admin:"-",state:poe.supported===false?"当前机型/系统未返回 PoE 数据":"暂无 PoE 数据",watts:"-",raw:""}],x=>[x.interface,x.admin,x.state,x.watts,x.raw]);const i=state.integrations||{};el.integrationView.innerHTML=`<span>Syslog <b>${i.syslog?"ON":"OFF"}</b></span><span>sFlow <b>${i.sflow?"ON":"OFF"}</b></span><span>NetFlow/IPFIX <b>${i.netflow?"ON":"OFF"}</b></span><span>采集 <b>${(state.vlans||[]).length} VLAN / ${(state.arp||[]).length} ARP / ${(state.fdb||[]).length} FDB</b></span>`;if(state.history?.traffic?.length)historyData.splice(0,historyData.length,...state.history.traffic.slice(-80).map(x=>Number(x.totalMbps||0)));drawChart(state.traffic||{})}
     function render(state){const d=state.device||{},h=state.health||{},t=state.traffic||{},ports=state.ports||[],up=ports.filter(p=>p.status==="up").length,media=ports.filter(p=>p.hasMedia&&p.status!=="up").length,err=ports.filter(p=>Number(p.errors||0)>0).length;currentPorts=ports;currentPortCards=groupPorts(ports);ports.forEach(p=>{const k=p.name;const saved=(state.history?.ports?.[k]||[]).slice(-80).map(x=>({rx:Number(x.rxMbps||0),tx:Number(x.txMbps||0)}));portHistory[k]=saved.length?saved:(portHistory[k]||[]);if(!saved.length)portHistory[k].push({rx:Number(p.rxMbps||0),tx:Number(p.txMbps||0)});while(portHistory[k].length>80)portHistory[k].shift()});el.hostname.textContent=d.hostname||"-";el.eosVersion.textContent=d.eosVersion||"-";el.forwardingLive.textContent=d.forwardingRate||t.packetRateLabel||"-";el.switchingLive.textContent=d.switchingCapacity||t.throughputLabel||"-";el.trafficSubline.textContent=`RX ${mbps(t.rxMbps)} / TX ${mbps(t.txMbps)}`;el.capacitySubline.textContent=`占用 ${Number(t.capacityUtilization||0).toFixed(4)}% of 2.56Tbps`;const summary=`${up}/${ports.length} logical up, ${currentPortCards.length} cards, ${media} media, ${err} error`;el.portSummary.textContent=summary;el.portsPageSummary.textContent=summary;el.lastRefresh.textContent=fmt(d.lastRefresh);el.cpuMeter.value=Number(h.cpu||0);el.cpuValue.textContent=pct(h.cpu);el.memoryMeter.value=Number(h.memory||0);el.memoryValue.textContent=pct(h.memory);el.temperatureMeter.value=Number(h.temperature||0);el.temperatureValue.textContent=Number.isFinite(Number(h.temperature))?`${h.temperature}C`:"-";el.fanStatus.textContent=h.fanStatus||"-";el.psuStatus.textContent=h.psuStatus||"-";el.portGrid.innerHTML=currentPortCards.map((p,i)=>`<button class="port" data-index="${i}" data-breakout="${p.kind==="breakout"}" data-status="${p.status}" data-media="${Boolean(p.hasMedia)}" data-errors="${Number(p.errors||0)>0}"><div class="port-name"><span>${esc(p.label||p.name)}</span><span class="port-speed">${esc(p.speed)}</span></div><div class="port-detail">${esc(p.media)} / VLAN ${esc(p.vlan)}<br>${esc(p.description||p.status)}</div>${p.kind==="breakout"?`<div class="lane-dots">${p.lanes.map(x=>`<i title="${esc(x.label||x.name)}" data-status="${esc(x.status)}" data-media="${Boolean(x.hasMedia&&x.status!=="up")}" data-errors="${Number(x.errors||0)>0}"></i>`).join("")}</div>`:""}<div class="port-traffic"><span>RX <b>${mbps(p.rxMbps)}</b></span><span>TX <b>${mbps(p.txMbps)}</b></span></div></button>`).join("");if(activePortName&&el.portModal.classList.contains("show"))drawPortChart(activePortName);el.eventList.innerHTML=(state.events||[]).map(e=>`<li data-level="${e.level||"info"}"><span class="event-time">${fmt(e.time)} / ${esc(e.level||"info")}</span><span class="event-message">${esc(e.message)}</span></li>`).join("");renderExtra(state)}
-    async function load(){const p=await req("/api/state");render(p.state)}async function refresh(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="刷新中";try{const p=await req("/api/refresh",{method:"POST",body:"{}"});render(p.state);toast("已从 EOS CLI 刷新")}catch(e){toast(e.message)}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}
+    let refreshRun=0;const progressiveScopes=["tables","extras","optics","protocols"];async function load(scope="state"){const p=scope==="state"?await req("/api/state"):await req("/api/refresh",{method:"POST",body:JSON.stringify({scope})});render(p.state);return p.state}async function loadProgressive(){const run=++refreshRun;for(const scope of progressiveScopes){if(run!==refreshRun)return;try{await load(scope)}catch(e){toast(`${scope}: ${e.message}`)}}}async function boot(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="加载中";try{await load("core");loadProgressive()}catch(e){toast(e.message);await load().catch(()=>{})}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}async function refresh(){el.refreshBtn.disabled=true;el.refreshBtn.textContent="刷新中";try{await load("core");toast("核心状态已刷新，其余数据继续加载");loadProgressive()}catch(e){toast(e.message)}finally{el.refreshBtn.disabled=false;el.refreshBtn.textContent="刷新"}}
     function opsPayload(dryRun){return{action:el.opsAction.value,confirm:el.opsConfirm.value,dryRun,params:{interface:el.opsInterface.value,state:el.opsState.value,mode:el.opsState.value,vlan:el.opsVlan.value,nativeVlan:el.opsText.value,description:el.opsText.value,name:el.opsText.value,address:el.opsAddress.value,network:el.opsAddress.value,addressFamily:el.opsAddress.value||"ipv4",process:el.opsProcess.value,asn:el.opsProcess.value,area:el.opsArea.value,remoteAs:el.opsArea.value,neighbor:el.opsNeighbor.value}}}async function runOps(dryRun){el.opsOutput.textContent=dryRun?"生成配置中...":"执行配置中...";try{const p=await req("/api/config",{method:"POST",body:JSON.stringify(opsPayload(dryRun))});el.opsOutput.textContent=(p.commands||[]).join("\n")+(p.diff?`\n\nDIFF:\n${p.diff}`:"")+(p.output?`\n\n${p.output}`:"");if(!dryRun){toast("配置已提交");refresh()}}catch(err){el.opsOutput.textContent=`ERROR: ${err.message}`}}
-    el.refreshBtn.addEventListener("click",refresh);el.themeBtn.addEventListener("click",()=>setTheme(document.body.dataset.theme==="dark"?"light":"dark"));el.dashboardNav.addEventListener("click",()=>showPage("dashboard"));el.portsNav.addEventListener("click",()=>showPage("ports"));el.openPortsBtn.addEventListener("click",()=>showPage("ports"));el.portGrid.addEventListener("click",e=>{const card=e.target.closest(".port");if(card)showPort(Number(card.dataset.index))});el.modalBody.addEventListener("click",e=>{const btn=e.target.closest(".lane-btn");if(btn){const p=currentPorts.find(x=>x.name===btn.dataset.port);showPortDetail(p)}});el.modalClose.addEventListener("click",()=>el.portModal.classList.remove("show"));el.portModal.addEventListener("click",e=>{if(e.target===el.portModal)el.portModal.classList.remove("show")});el.opsPreview.addEventListener("click",()=>runOps(true));el.opsForm.addEventListener("submit",e=>{e.preventDefault();runOps(false)});el.commandForm.addEventListener("submit",async e=>{e.preventDefault();const command=el.commandInput.value.trim();if(!command)return;el.commandOutput.textContent=`> ${command}\n运行中...`;try{const p=await req("/api/command",{method:"POST",body:JSON.stringify({command})});el.commandOutput.textContent=`> ${p.command}\n${p.output}`}catch(err){el.commandOutput.textContent=`> ${command}\nERROR: ${err.message}`}});showPage(location.pathname==="/ports"?"ports":"dashboard");load().catch(e=>toast(e.message));setInterval(()=>load().catch(()=>{}),15000);
+    el.refreshBtn.addEventListener("click",refresh);el.themeBtn.addEventListener("click",()=>setTheme(document.body.dataset.theme==="dark"?"light":"dark"));el.dashboardNav.addEventListener("click",()=>showPage("dashboard"));el.portsNav.addEventListener("click",()=>showPage("ports"));el.openPortsBtn.addEventListener("click",()=>showPage("ports"));el.portGrid.addEventListener("click",e=>{const card=e.target.closest(".port");if(card)showPort(Number(card.dataset.index))});el.modalBody.addEventListener("click",e=>{const btn=e.target.closest(".lane-btn");if(btn){const p=currentPorts.find(x=>x.name===btn.dataset.port);showPortDetail(p)}});el.modalClose.addEventListener("click",()=>el.portModal.classList.remove("show"));el.portModal.addEventListener("click",e=>{if(e.target===el.portModal)el.portModal.classList.remove("show")});el.opsPreview.addEventListener("click",()=>runOps(true));el.opsForm.addEventListener("submit",e=>{e.preventDefault();runOps(false)});el.commandForm.addEventListener("submit",async e=>{e.preventDefault();const command=el.commandInput.value.trim();if(!command)return;el.commandOutput.textContent=`> ${command}\n运行中...`;try{const p=await req("/api/command",{method:"POST",body:JSON.stringify({command})});el.commandOutput.textContent=`> ${p.command}\n${p.output}`}catch(err){el.commandOutput.textContent=`> ${command}\nERROR: ${err.message}`}});document.addEventListener("visibilitychange",()=>{if(!document.hidden)refresh()});showPage(location.pathname==="/ports"?"ports":"dashboard");boot();setInterval(()=>load().catch(()=>{}),15000);
   </script>
 </body>
 </html>"""
@@ -892,7 +1882,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def read_json(self):
         size = int(self.headers.get("Content-Length", "0") or "0")
@@ -938,13 +1931,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
 
         if path == "/api/state":
-            if not Handler.cached_state or time.time() - Handler.cached_at > 10:
-                Handler.cached_state = collect_state()
+            if not Handler.cached_state:
+                Handler.cached_state = collect_state("core")
+                Handler.cached_at = time.time()
+            elif time.time() - Handler.cached_at > 60:
+                Handler.cached_state = merge_state(Handler.cached_state, collect_state("core"))
                 Handler.cached_at = time.time()
             self.send_json(200, {"ok": True, "state": Handler.cached_state})
             return
@@ -957,7 +1957,12 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             if path == "/api/refresh":
-                Handler.cached_state = collect_state()
+                payload = self.read_json()
+                scope = str(payload.get("scope") or "full").lower()
+                if scope not in ("core", "tables", "optics", "protocols", "extras", "full"):
+                    raise ValueError("Unknown refresh scope.")
+                state = collect_state(scope)
+                Handler.cached_state = state if scope == "full" else merge_state(Handler.cached_state, state)
                 Handler.cached_at = time.time()
                 self.send_json(200, {"ok": True, "state": Handler.cached_state})
                 return
@@ -965,7 +1970,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/command":
                 payload = self.read_json()
                 command = str(payload.get("command", "")).strip()
-                output = run_cli(command)
+                output = run_read_command(command)
                 self.send_json(200, {"ok": True, "command": command, "output": output})
                 return
 
