@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="${REPO:-zong1024/Arista-Management-Port-Web-Interface}"
+REPO="${REPO:-ZONGRUICHD/Arista-Switch-Web-Dashboard}"
 BRANCH="${BRANCH:-master}"
 APP_URL="${APP_URL:-https://raw.githubusercontent.com/$REPO/$BRANCH/onbox/arista7050_web.py}"
 APP_PATH="${APP_PATH:-/mnt/flash/arista7050_web.py}"
