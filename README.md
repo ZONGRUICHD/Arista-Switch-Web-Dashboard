@@ -14,25 +14,25 @@ bash
 一条命令安装或更新 WebUI：
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ZONGRUICHD/Arista-Switch-Web-Dashboard/master/install.sh | sh
 ```
 
 安装并设置开机自启动：
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | STARTUP=1 sh
+curl -fsSL https://raw.githubusercontent.com/ZONGRUICHD/Arista-Switch-Web-Dashboard/master/install.sh | STARTUP=1 sh
 ```
 
 自定义端口或分支：
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | PORT=2480 BRANCH=master sh
+curl -fsSL https://raw.githubusercontent.com/ZONGRUICHD/Arista-Switch-Web-Dashboard/master/install.sh | PORT=2480 BRANCH=master sh
 ```
 
 可选开启 Basic 登录认证：
 
 ```text
-curl -fsSL https://raw.githubusercontent.com/zong1024/Arista-Management-Port-Web-Interface/master/install.sh | WEB_USERNAME=admin WEB_PASSWORD=你的密码 sh
+curl -fsSL https://raw.githubusercontent.com/ZONGRUICHD/Arista-Switch-Web-Dashboard/master/install.sh | WEB_USERNAME=admin WEB_PASSWORD=你的密码 sh
 ```
 
 如果交换机本机 `curl http://127.0.0.1:2480/` 正常，但电脑访问 `http://交换机IP:2480/` 超时，通常是 EOS control-plane ACL 未放行 TCP/2480。不要把只包含 2480 的 ACL 直接绑定到 `system control-plane`，否则可能替换默认控制面 ACL，影响 SSH、SNMP、路由协议等管理/控制流量。推荐先复制当前 `default-control-plane-acl` 的规则，再额外插入 TCP/2480：
