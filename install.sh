@@ -556,6 +556,28 @@ write memory" > "$event_cli_output_tmp" 2>&1; then
   verify_event_handler_matches "$event_backup"
 }
 
+disable_legacy_event_handler() {
+  event_cli_output_tmp="${STATE_DIR}/event-handler.disable.$$.tmp"
+  if ! run_eos_cli "configure terminal
+no event-handler $EVENT_HANDLER
+end
+write memory" > "$event_cli_output_tmp" 2>&1; then
+    return 1
+  fi
+  cli_output_is_clean "$event_cli_output_tmp" || return 1
+  rm -f "$event_cli_output_tmp"
+  event_cli_output_tmp=""
+  event_verify_tmp="${STATE_DIR}/event-handler.disabled.verify.$$.tmp"
+  if ! run_eos_cli "show running-config section event-handler $EVENT_HANDLER" > "${event_verify_tmp}.raw" 2>&1; then
+    return 1
+  fi
+  cli_output_is_clean "${event_verify_tmp}.raw" || return 1
+  normalize_event_handler_file "${event_verify_tmp}.raw" "${event_verify_tmp}.actual"
+  [ ! -s "${event_verify_tmp}.actual" ] || return 1
+  rm -f "$event_verify_tmp" "${event_verify_tmp}.raw" "${event_verify_tmp}.actual"
+  event_verify_tmp=""
+}
+
 configure_startup() {
   [ "$startup_enabled" -eq 1 ] || return 0
   event_mutation_started=1
@@ -660,7 +682,11 @@ rollback_install() {
     rm -f "$AUTH_CONFIG" || rollback_ok=0
   fi
   if [ "$event_mutation_started" -eq 1 ]; then
-    restore_event_handler || rollback_ok=0
+    if [ "$previous_managed" -eq 1 ]; then
+      restore_event_handler || rollback_ok=0
+    else
+      disable_legacy_event_handler || rollback_ok=0
+    fi
   fi
   if [ "$production_was_running" -eq 1 ] && \
      { [ "$production_stop_started" -eq 1 ] || [ "$application_replaced" -eq 1 ]; } && \
@@ -925,6 +951,40 @@ cat > "$wrapper_tmp" <<EOF
 #!/usr/bin/env sh
 set -eu
 export WEB_DATA_DIR="$STATE_DIR"
+if [ -f "$PID_FILE" ]; then
+  managed_pid=\$(sed -n '1p' "$PID_FILE" 2>/dev/null || true)
+  case "\$managed_pid" in
+    ''|*[!0-9]*) echo "ERROR: invalid dashboard PID file." >&2; exit 1 ;;
+  esac
+  if kill -0 "\$managed_pid" 2>/dev/null; then
+    if [ ! -r "/proc/\$managed_pid/cmdline" ] || \
+       ! tr '\\000' '\\n' < "/proc/\$managed_pid/cmdline" | grep -F -x -e "$APP_PATH" >/dev/null 2>&1; then
+      echo "ERROR: dashboard PID belongs to an unexpected process." >&2
+      exit 1
+    fi
+    if command -v curl >/dev/null 2>&1; then
+      health_body=\$(curl -fkSs --connect-timeout 2 --max-time 4 "https://$TLS_IP:$PORT/healthz" 2>/dev/null || true)
+    else
+      health_body=\$(wget --no-check-certificate -q -T 4 -O - "https://$TLS_IP:$PORT/healthz" 2>/dev/null || true)
+    fi
+    if printf '%s' "\$health_body" | grep -F -e "$REF" >/dev/null 2>&1 && \
+       printf '%s' "\$health_body" | grep -F -e "$ARTIFACT_SHA" >/dev/null 2>&1; then
+      exit 0
+    fi
+    echo "ERROR: managed dashboard process is running but failed pinned HTTPS health." >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
+fi
+if command -v ss >/dev/null 2>&1; then
+  if ss -ltn 2>/dev/null | awk -v suffix=":$PORT" '\$1 == "LISTEN" && \$4 ~ (suffix "\$") {found=1} END {exit !found}'; then
+    echo "ERROR: dashboard port is occupied without a verified PID." >&2
+    exit 1
+  fi
+elif netstat -ltn 2>/dev/null | awk -v suffix=":$PORT" '\$1 ~ /^tcp/ && \$4 ~ (suffix "\$") {found=1} END {exit !found}'; then
+  echo "ERROR: dashboard port is occupied without a verified PID." >&2
+  exit 1
+fi
 if [ -f "$LOG" ]; then
   size=\$(wc -c < "$LOG" | tr -d ' ')
   case "\$size" in ''|*[!0-9]*) size=0 ;; esac

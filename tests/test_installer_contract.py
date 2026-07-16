@@ -149,7 +149,7 @@ class InstallerContractTests(unittest.TestCase):
         force_targets = re.findall(r"\bkill -(?:TERM|KILL)\s+([^\s;|]+)", self.script)
         self.assertEqual(set(force_targets), {'"$stop_pid"'})
         for target in re.findall(r"\bkill -0\s+([^\s;|]+)", self.script):
-            self.assertRegex(target, r'^"\$[A-Za-z_][A-Za-z0-9_]*"$')
+            self.assertRegex(target, r'^"\\?\$[A-Za-z_][A-Za-z0-9_]*"$')
 
     def test_authenticated_candidate_smoke_precedes_cutover(self):
         main = self.script[self.script.index('[ -n "$REF" ]') :]
@@ -202,11 +202,59 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('export WEB_DATA_DIR="$STATE_DIR"', self.script)
         self.assertNotIn('STATE_DIR="${STATE_DIR:-/mnt/flash', self.script)
 
+    def test_startup_wrapper_is_pid_scoped_and_idempotent(self):
+        wrapper_start = self.script.index('cat > "$wrapper_tmp" <<EOF')
+        wrapper_end = self.script.index("\nEOF\n", wrapper_start)
+        wrapper = self.script[wrapper_start:wrapper_end]
+        self.assertIn('kill -0 "\\$managed_pid"', wrapper)
+        self.assertIn('/proc/\\$managed_pid/cmdline', wrapper)
+        self.assertIn('https://$TLS_IP:$PORT/healthz', wrapper)
+        self.assertIn('grep -F -e "$REF"', wrapper)
+        self.assertIn('grep -F -e "$ARTIFACT_SHA"', wrapper)
+        self.assertIn('dashboard port is occupied without a verified PID', wrapper)
+
+    def test_generated_startup_wrapper_has_valid_posix_syntax(self):
+        start = self.script.index('cat > "$wrapper_tmp" <<EOF')
+        end = self.script.index("\nEOF\n", start) + len("\nEOF\n")
+        block = self.script[start:end]
+        with tempfile.TemporaryDirectory() as temp:
+            wrapper = Path(temp) / "start-dashboard.sh"
+            values = {
+                "wrapper_tmp": self.shell_path(wrapper),
+                "STATE_DIR": "/persist/secure/arista-dashboard",
+                "PID_FILE": "/persist/secure/arista-dashboard/dashboard.pid",
+                "APP_PATH": "/mnt/flash/arista7050_web.py",
+                "TLS_IP": "192.168.0.248",
+                "PORT": "2480",
+                "REF": "a" * 40,
+                "ARTIFACT_SHA": "b" * 64,
+                "LOG": "/persist/secure/arista-dashboard/dashboard.log",
+                "MAX_LOG_BYTES": "2097152",
+                "PYTHON": "python3",
+                "HOST": "192.168.0.248",
+                "AUTH_CONFIG": "/persist/secure/arista-dashboard/auth.json",
+                "TLS_CERT": "/persist/secure/arista-dashboard/dashboard.crt",
+                "TLS_KEY": "/persist/secure/arista-dashboard/dashboard.key",
+            }
+            assignments = ["%s=%s" % (key, shlex.quote(value)) for key, value in values.items()]
+            result = self.run_shell("\n".join(assignments + [block, 'sh -n "$wrapper_tmp"']))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rendered = wrapper.read_text(encoding="utf-8")
+            self.assertIn('kill -0 "$managed_pid"', rendered)
+            self.assertIn("tr '\\000' '\\n'", rendered)
+
     def test_legacy_rollback_deliberately_leaves_http_app_stopped(self):
         restart = self.function_text("restart_previous")
         self.assertIn('sh "$WRAPPER_PATH"', restart)
         self.assertIn("unauthenticated HTTP service was deliberately left stopped", restart)
         self.assertNotRegex(restart, r'(?m)^\s*"?\$PYTHON"?\s+"?\$APP_PATH"?')
+        rollback = self.function_text("rollback_install")
+        disable = self.function_text("disable_legacy_event_handler")
+        self.assertIn('disable_legacy_event_handler || rollback_ok=0', rollback)
+        self.assertRegex(rollback, r'(?s)if \[ "\$previous_managed" -eq 1 \]; then\s+restore_event_handler')
+        self.assertIn('no event-handler $EVENT_HANDLER', disable)
+        self.assertIn('write memory', disable)
+        self.assertIn('[ ! -s "${event_verify_tmp}.actual" ]', disable)
 
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
