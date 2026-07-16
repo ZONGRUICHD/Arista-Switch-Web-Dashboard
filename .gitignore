@@ -1,4 +1,8 @@
 node_modules/
+test-results/
+playwright-report/
+.cache/
+work/
 *.log
 data/config.json
 __pycache__/
