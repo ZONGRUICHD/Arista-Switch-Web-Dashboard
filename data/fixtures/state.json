@@ -1,0 +1,95 @@
+{
+  "device": {
+    "model": "Arista DCS-7050QX-32S-F",
+    "hostname": "leaf-7050qx-preview",
+    "serial": "PREVIEW-ONLY",
+    "eosVersion": "4.28.6.1M (fixture)",
+    "uptime": "17 days, 04:28:11",
+    "switchingCapacity": "2.56 Tbps",
+    "forwardingRate": "1.44 Bpps",
+    "airflow": "Front-to-back",
+    "lastRefresh": "2026-07-17T08:00:00.000Z",
+    "source": "local fixture"
+  },
+  "health": {
+    "cpu": 13,
+    "memory": 36,
+    "temperature": 50,
+    "fanStatus": "OK",
+    "psuStatus": "1+1 OK"
+  },
+  "traffic": {
+    "rxMbps": 18540.6,
+    "txMbps": 14721.2,
+    "capacityUtilization": 1.2993,
+    "throughputLabel": "33.26 Gbps",
+    "packetRateLabel": "4.82 Mpps"
+  },
+  "history": {
+    "traffic": [
+      { "time": "2026-07-17T07:51:00.000Z", "rxMbps": 12140, "txMbps": 10420 },
+      { "time": "2026-07-17T07:52:00.000Z", "rxMbps": 14280, "txMbps": 11390 },
+      { "time": "2026-07-17T07:53:00.000Z", "rxMbps": 13620, "txMbps": 12640 },
+      { "time": "2026-07-17T07:54:00.000Z", "rxMbps": 16420, "txMbps": 13210 },
+      { "time": "2026-07-17T07:55:00.000Z", "rxMbps": 17110, "txMbps": 14280 },
+      { "time": "2026-07-17T07:56:00.000Z", "rxMbps": 15980, "txMbps": 13040 },
+      { "time": "2026-07-17T07:57:00.000Z", "rxMbps": 18120, "txMbps": 13980 },
+      { "time": "2026-07-17T07:58:00.000Z", "rxMbps": 17640, "txMbps": 15110 },
+      { "time": "2026-07-17T07:59:00.000Z", "rxMbps": 19020, "txMbps": 14620 },
+      { "time": "2026-07-17T08:00:00.000Z", "rxMbps": 18540.6, "txMbps": 14721.2 }
+    ],
+    "ports": {}
+  },
+  "ports": [
+    { "name": "Ethernet1/1", "status": "up", "speed": "10G", "duplex": "full", "vlan": "10", "media": "10GBASE-SR", "description": "compute-a01", "rxMbps": 4210.4, "txMbps": 3180.1, "errors": 0, "hasMedia": true },
+    { "name": "Ethernet1/2", "status": "up", "speed": "10G", "duplex": "full", "vlan": "10", "media": "10GBASE-SR", "description": "compute-a02", "rxMbps": 3880.2, "txMbps": 2960.5, "errors": 0, "hasMedia": true },
+    { "name": "Ethernet1/3", "status": "down", "speed": "10G", "duplex": "full", "vlan": "10", "media": "10GBASE-SR", "description": "reserved", "rxMbps": 0, "txMbps": 0, "errors": 0, "hasMedia": true },
+    { "name": "Ethernet1/4", "status": "up", "speed": "10G", "duplex": "full", "vlan": "10", "media": "10GBASE-SR", "description": "compute-a04", "rxMbps": 2910.1, "txMbps": 2810.8, "errors": 12, "hasMedia": true },
+    { "name": "Ethernet2", "status": "up", "speed": "40G", "duplex": "full", "vlan": "trunk", "media": "40GBASE-CR4", "description": "spine-01 Ethernet9", "rxMbps": 4820.8, "txMbps": 4350.2, "errors": 0, "hasMedia": true, "transceiver": { "present": true, "type": "40GBASE-CR4", "vendor": "Arista", "serial": "CAB-PREVIEW-01", "temperature": "41.2 C", "txPower": "—", "rxPower": "—" } },
+    { "name": "Ethernet3", "status": "up", "speed": "40G", "duplex": "full", "vlan": "trunk", "media": "40GBASE-SR4", "description": "spine-02 Ethernet9", "rxMbps": 2719.1, "txMbps": 1419.6, "errors": 0, "hasMedia": true, "transceiver": { "present": true, "type": "40GBASE-SR4", "vendor": "Finisar", "serial": "OPT-PREVIEW-03", "temperature": "43.7 C", "txPower": "-2.1 dBm", "rxPower": "-2.8 dBm" } },
+    { "name": "Ethernet4", "status": "down", "speed": "40G", "duplex": "full", "vlan": "trunk", "media": "Not Present", "description": "unused", "rxMbps": 0, "txMbps": 0, "errors": 0, "hasMedia": false },
+    { "name": "Ethernet5", "status": "down", "speed": "40G", "duplex": "full", "vlan": "20", "media": "40GBASE-SR4", "description": "storage uplink — remote end down", "rxMbps": 0, "txMbps": 0, "errors": 3, "hasMedia": true },
+    { "name": "Management1", "status": "up", "speed": "1G", "duplex": "full", "vlan": "routed", "media": "1000BASE-T", "description": "management", "rxMbps": 0.8, "txMbps": 0.4, "errors": 0, "hasMedia": true }
+  ],
+  "alerts": [
+    { "severity": "warning", "title": "Ethernet5 已插介质但链路 Down", "detail": "检查远端设备、光纤和协商参数。" },
+    { "severity": "warning", "title": "Ethernet1/4 检测到接口错误", "detail": "累计 12 个错误，建议查看详细计数器。" }
+  ],
+  "events": [
+    { "time": "2026-07-17T08:00:00.000Z", "level": "success", "message": "本地 fixture 已刷新。" },
+    { "time": "2026-07-17T07:56:00.000Z", "level": "warning", "message": "Ethernet5 介质存在但链路未建立。" },
+    { "time": "2026-07-17T07:48:00.000Z", "level": "info", "message": "服务端历史采样已完成。" }
+  ],
+  "lldp": [
+    { "localPort": "Ethernet2", "systemName": "spine-01", "neighborPort": "Ethernet9", "managementAddress": "192.0.2.11", "description": "Arista DCS-7050SX3" },
+    { "localPort": "Ethernet3", "systemName": "spine-02", "neighborPort": "Ethernet9", "managementAddress": "192.0.2.12", "description": "Arista DCS-7050SX3" }
+  ],
+  "vlans": [
+    { "id": 1, "name": "default", "status": "active", "ports": "Ethernet4" },
+    { "id": 10, "name": "COMPUTE", "status": "active", "ports": "Ethernet1/1-4" },
+    { "id": 20, "name": "STORAGE", "status": "active", "ports": "Ethernet5" }
+  ],
+  "arp": [
+    { "ip": "192.0.2.11", "mac": "00:1c:73:aa:00:11", "interface": "Vlan10", "age": "0:03:12" },
+    { "ip": "192.0.2.12", "mac": "00:1c:73:aa:00:12", "interface": "Vlan10", "age": "0:01:47" }
+  ],
+  "fdb": [
+    { "vlan": 10, "mac": "00:1c:73:aa:00:11", "type": "dynamic", "interface": "Ethernet2" },
+    { "vlan": 10, "mac": "00:1c:73:aa:00:12", "type": "dynamic", "interface": "Ethernet3" },
+    { "vlan": 10, "mac": "52:54:00:91:2a:01", "type": "dynamic", "interface": "Ethernet1/1" }
+  ],
+  "protocols": {
+    "ospf": [{ "neighbor": "192.0.2.11", "state": "FULL", "interface": "Ethernet2", "deadTime": "00:00:34" }],
+    "ospfv3": [],
+    "bgp": [{ "neighbor": "192.0.2.12", "state": "Established", "prefixes": 148, "uptime": "17d04h" }]
+  },
+  "transceivers": [
+    { "interface": "Ethernet2", "type": "40GBASE-CR4", "vendor": "Arista", "temperature": "—", "txPower": "—", "rxPower": "—", "alerts": [] },
+    { "interface": "Ethernet3", "type": "40GBASE-SR4", "vendor": "Finisar", "temperature": "43.7 C", "txPower": "-2.1 dBm", "rxPower": "-2.8 dBm", "alerts": [] },
+    { "interface": "Ethernet5", "type": "40GBASE-SR4", "vendor": "Avago", "temperature": "48.1 C", "txPower": "-2.4 dBm", "rxPower": "No signal", "alerts": ["RX loss"] }
+  ],
+  "poe": { "supported": false, "ports": [] },
+  "integrations": { "syslog": true, "sflow": true, "netflow": false, "telemetry": false },
+  "loading": { "core": "done", "metrics": "done", "health": "done", "tables": "done", "discovery": "done", "optics": "done", "protocols": "done", "extras": "done" },
+  "meta": { "source": "local fixture", "stale": false, "version": "preview" }
+}

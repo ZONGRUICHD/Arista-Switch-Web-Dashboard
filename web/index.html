@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Arista 7050QX 交换机本机监控、诊断与受控配置控制台。" />
+    <meta name="theme-color" content="#0b1118" />
+    <title>Arista 7050QX 运维台</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230f766e'/%3E%3Cpath d='M16 20h32v8H16zm0 16h32v8H16z' fill='white'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-theme="dark">
+    <a class="skip-link" href="#mainContent">跳到主要内容</a>
+
+    <section id="loginView" class="auth-shell" aria-labelledby="loginTitle">
+      <div class="auth-card">
+        <div class="brand-mark" aria-hidden="true"><i></i><i></i></div>
+        <p class="eyebrow">ON-BOX OPERATIONS</p>
+        <h1 id="loginTitle">登录交换机运维台</h1>
+        <p class="auth-copy">使用交换机账号登录。凭据仅用于当前 HTTPS 会话。</p>
+        <form id="loginForm" class="stack-form" method="post" action="/api/auth/login">
+          <label for="loginUsername">用户名</label>
+          <input id="loginUsername" name="username" autocomplete="username" required />
+          <label for="loginPassword">密码</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required />
+          <p id="loginError" class="form-error" role="alert" hidden></p>
+          <button class="button primary" type="submit">登录</button>
+        </form>
+        <p class="auth-note">连接应显示为 HTTPS。证书首次使用时需要在管理终端确认。</p>
+      </div>
+    </section>
+
+    <div id="appShell" class="app-shell" hidden>
+      <header class="app-header">
+        <div class="header-row">
+          <div class="device-identity">
+            <div class="brand-mark compact" aria-hidden="true"><i></i><i></i></div>
+            <div>
+              <p class="eyebrow">ARISTA CONTROL PLANE</p>
+              <div class="device-title-row">
+                <h1 id="deviceHostname">正在连接</h1>
+                <span id="deviceModel" class="muted-text">DCS-7050QX</span>
+              </div>
+            </div>
+          </div>
+          <div class="header-actions">
+            <span id="connectionBadge" class="status-badge neutral"><i></i><span>正在连接</span></span>
+            <span id="lastRefresh" class="timestamp">尚未刷新</span>
+            <label class="compact-field" for="refreshInterval">
+              <span class="sr-only">自动刷新间隔</span>
+              <select id="refreshInterval" aria-label="自动刷新间隔">
+                <option value="0">手动刷新</option>
+                <option value="30000">30 秒</option>
+                <option value="60000" selected>60 秒</option>
+                <option value="300000">5 分钟</option>
+              </select>
+            </label>
+            <button id="refreshButton" class="button secondary" type="button">刷新</button>
+            <button id="unlockButton" class="button secondary" type="button">解锁操作</button>
+            <button id="themeButton" class="icon-button" type="button" aria-label="切换为浅色主题" title="切换主题">◐</button>
+            <button id="logoutButton" class="icon-button" type="button" aria-label="退出登录" title="退出登录">↪</button>
+          </div>
+        </div>
+        <nav class="primary-nav" aria-label="主导航">
+          <a href="/" data-route="overview">概览</a>
+          <a href="/ports" data-route="ports">端口</a>
+          <a href="/network" data-route="network">网络</a>
+          <a href="/diagnostics" data-route="diagnostics">诊断</a>
+          <a href="/changes" data-route="changes">变更</a>
+        </nav>
+      </header>
+
+      <main id="mainContent" class="main-content" tabindex="-1">
+        <section id="overviewPage" class="page" data-page="overview" aria-labelledby="overviewTitle">
+          <div class="page-heading">
+            <div>
+              <p class="eyebrow">LIVE OPERATIONS</p>
+              <h2 id="overviewTitle">运行概览</h2>
+              <p>先看异常，再看容量与变化。</p>
+            </div>
+            <span id="overviewState" class="section-state" data-status="loading" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">正在加载核心状态</span>
+          </div>
+
+          <div class="overview-grid">
+            <section class="surface alerts-surface" aria-labelledby="alertsTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="section-kicker">需要处理</p>
+                  <h3 id="alertsTitle">告警</h3>
+                </div>
+                <strong id="alertCount" class="count-display">—</strong>
+              </div>
+              <div id="alertsList" class="state-content skeleton-list" aria-live="polite"></div>
+            </section>
+
+            <section class="surface health-surface" aria-labelledby="healthTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="section-kicker">设备健康</p>
+                  <h3 id="healthTitle">系统资源</h3>
+                </div>
+                <span id="healthLabel" class="status-badge neutral"><i></i><span>待采集</span></span>
+              </div>
+              <div id="healthMetrics" class="health-metrics skeleton-grid"></div>
+            </section>
+          </div>
+
+          <section class="metric-strip" aria-label="设备摘要">
+            <article><span>逻辑端口</span><strong id="metricPorts">—</strong><small id="metricPortsNote">正在采集</small></article>
+            <article><span>EOS</span><strong id="metricEos">—</strong><small id="metricUptime">运行时间 —</small></article>
+            <article><span>当前吞吐</span><strong id="metricTraffic">—</strong><small id="metricCapacity">容量占用 —</small></article>
+            <article><span>转发能力</span><strong id="metricForwarding">—</strong><small id="metricSource">数据源 —</small></article>
+          </section>
+
+          <div class="overview-grid lower-grid">
+            <section class="surface traffic-surface" aria-labelledby="trafficTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="section-kicker">最近 24 小时</p>
+                  <h3 id="trafficTitle">聚合流量</h3>
+                </div>
+                <div class="traffic-legend" aria-hidden="true"><span class="rx">RX</span><span class="tx">TX</span></div>
+              </div>
+              <div class="chart-wrap">
+                <canvas id="trafficChart" role="img" aria-labelledby="trafficTitle" aria-describedby="trafficChartDescription"></canvas>
+                <p id="trafficChartDescription" class="sr-only">流量历史尚未加载。</p>
+              </div>
+              <div id="trafficSummary" class="traffic-summary"></div>
+            </section>
+
+            <section class="surface events-surface" aria-labelledby="eventsTitle">
+              <div class="section-heading">
+                <div>
+                  <p class="section-kicker">最近变化</p>
+                  <h3 id="eventsTitle">事件</h3>
+                </div>
+              </div>
+              <ol id="eventsList" class="event-list skeleton-list"></ol>
+            </section>
+          </div>
+        </section>
+
+        <section id="portsPage" class="page" data-page="ports" aria-labelledby="portsTitle" hidden>
+          <div class="page-heading split-heading">
+            <div>
+              <p class="eyebrow">INTERFACE MAP</p>
+              <h2 id="portsTitle">端口</h2>
+              <p id="portsSummary">正在采集端口状态。</p>
+            </div>
+            <span id="portsState" class="section-state" data-status="loading" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">正在加载</span>
+          </div>
+          <section class="surface filter-bar" aria-label="端口筛选">
+            <label class="search-field" for="portSearch"><span>搜索</span><input id="portSearch" type="search" placeholder="端口、描述、VLAN" /></label>
+            <label for="portFilter"><span>状态</span><select id="portFilter"><option value="all">全部</option><option value="up">Up</option><option value="down">Down</option><option value="errors">有错误</option><option value="media">已插介质</option></select></label>
+            <div class="port-legend" aria-label="状态说明"><span><i class="signal up"></i>Up</span><span><i class="signal down"></i>Down</span><span><i class="signal warning"></i>异常</span></div>
+          </section>
+          <div id="portGrid" class="port-grid skeleton-grid" aria-live="polite"></div>
+          <div id="portsEmpty" class="empty-state" hidden><strong>没有匹配的端口</strong><span>调整搜索或状态筛选。</span></div>
+        </section>
+
+        <section id="networkPage" class="page" data-page="network" aria-labelledby="networkTitle" hidden>
+          <div class="page-heading split-heading">
+            <div>
+              <p class="eyebrow">CONTROL &amp; DISCOVERY</p>
+              <h2 id="networkTitle">网络数据</h2>
+              <p>邻居、转发表、协议和物理介质集中查看。</p>
+            </div>
+            <span id="networkState" class="section-state" data-status="loading" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">正在加载</span>
+          </div>
+          <div class="network-grid">
+            <section class="surface table-surface wide" aria-labelledby="lldpTitle"><div class="section-heading"><h3 id="lldpTitle">LLDP 邻居</h3><span id="lldpCount" class="muted-text"></span></div><div id="lldpTable" class="table-region skeleton-block"></div></section>
+            <section class="surface table-surface" aria-labelledby="vlanTitle"><div class="section-heading"><h3 id="vlanTitle">VLAN</h3></div><div id="vlanTable" class="table-region skeleton-block"></div></section>
+            <section class="surface table-surface" aria-labelledby="protocolTitle"><div class="section-heading"><h3 id="protocolTitle">路由协议</h3></div><div id="protocolTable" class="table-region skeleton-block"></div></section>
+            <section class="surface table-surface" aria-labelledby="arpTitle"><div class="section-heading"><h3 id="arpTitle">ARP</h3></div><div id="arpTable" class="table-region skeleton-block"></div></section>
+            <section class="surface table-surface" aria-labelledby="fdbTitle"><div class="section-heading"><h3 id="fdbTitle">MAC 地址表</h3></div><div id="fdbTable" class="table-region skeleton-block"></div></section>
+            <section class="surface table-surface wide" aria-labelledby="opticsTitle"><div class="section-heading"><h3 id="opticsTitle">光模块与 PoE</h3></div><div id="opticsTable" class="table-region skeleton-block"></div><div id="poeSummary" class="inline-note"></div></section>
+            <section class="surface integrations-surface wide" aria-labelledby="integrationsTitle"><div class="section-heading"><h3 id="integrationsTitle">遥测集成</h3></div><div id="integrationsList" class="integration-list skeleton-grid"></div></section>
+          </div>
+        </section>
+
+        <section id="diagnosticsPage" class="page" data-page="diagnostics" aria-labelledby="diagnosticsTitle" hidden>
+          <div class="page-heading">
+            <div><p class="eyebrow">SAFE DIAGNOSTICS</p><h2 id="diagnosticsTitle">诊断</h2><p>只运行预定义的只读查询，不接受任意 CLI 文本。</p></div>
+          </div>
+          <div class="workbench-grid">
+            <section class="surface form-surface" aria-labelledby="diagnosticFormTitle">
+              <div class="section-heading"><h3 id="diagnosticFormTitle">选择诊断</h3><span class="status-badge safe"><i></i><span>只读目录</span></span></div>
+              <form id="diagnosticForm" class="stack-form" method="post" action="/api/diagnostics">
+                <label for="diagnosticCommand">诊断项目</label>
+                <select id="diagnosticCommand" name="commandId"></select>
+                <div id="diagnosticParams"></div>
+                <button id="diagnosticRun" class="button primary" type="submit">运行诊断</button>
+              </form>
+            </section>
+            <section class="surface output-surface" aria-labelledby="diagnosticOutputTitle">
+              <div class="section-heading"><h3 id="diagnosticOutputTitle">输出</h3><button id="copyDiagnostic" class="button text-button" type="button" disabled>复制</button></div>
+              <pre id="diagnosticOutput" tabindex="0">选择一项诊断后运行。</pre>
+            </section>
+          </div>
+        </section>
+
+        <section id="changesPage" class="page" data-page="changes" aria-labelledby="changesTitle" hidden>
+          <div class="page-heading split-heading">
+            <div><p class="eyebrow">CONTROLLED CHANGE</p><h2 id="changesTitle">变更</h2><p>所有配置先生成差异，再由已解锁的会话提交。</p></div>
+            <span id="lockStatus" class="status-badge locked"><i></i><span>只读模式</span></span>
+          </div>
+          <div class="change-layout">
+            <section class="surface form-surface" aria-labelledby="changeFormTitle">
+              <div class="section-heading"><h3 id="changeFormTitle">变更参数</h3></div>
+              <form id="changeForm" class="stack-form" method="post" action="/api/config/preview">
+                <label for="changeAction">操作</label>
+                <select id="changeAction" name="action"></select>
+                <p id="changeDescription" class="form-hint"></p>
+                <div id="changeFields" class="dynamic-fields"></div>
+                <button id="previewButton" class="button primary" type="submit">生成预览</button>
+              </form>
+            </section>
+            <section class="surface preview-surface" aria-labelledby="previewTitle">
+              <div class="section-heading"><div><h3 id="previewTitle">配置预览</h3><p id="previewExpiry" class="muted-text">尚未生成预览</p></div></div>
+              <pre id="previewOutput" tabindex="0">选择变更并填写参数。</pre>
+              <div id="applyBar" class="apply-bar" hidden>
+                <label class="confirm-check"><input id="confirmApply" type="checkbox" /> <span>我已核对命令和差异</span></label>
+                <button id="applyButton" class="button danger" type="button" disabled>提交配置</button>
+              </div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="drawerBackdrop" class="drawer-backdrop" hidden></div>
+    <aside id="portDrawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle" aria-hidden="true" tabindex="-1" hidden inert>
+      <div class="drawer-header"><div><p class="eyebrow">INTERFACE DETAIL</p><h2 id="drawerTitle">端口详情</h2></div><button id="drawerClose" class="icon-button" type="button" aria-label="关闭端口详情">×</button></div>
+      <div id="drawerBody" class="drawer-body"></div>
+    </aside>
+
+    <div id="unlockLayer" class="modal-layer" hidden>
+      <section id="unlockDialog" class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="unlockTitle" tabindex="-1">
+        <div class="section-heading"><div><p class="eyebrow">PRIVILEGED SESSION</p><h2 id="unlockTitle">解锁配置操作</h2></div><button id="unlockClose" class="icon-button" type="button" aria-label="关闭">×</button></div>
+        <p>再次输入交换机密码。解锁状态将在 15 分钟后自动失效。</p>
+        <form id="unlockForm" class="stack-form" method="post" action="/api/auth/unlock">
+          <label for="unlockPassword">密码</label>
+          <input id="unlockPassword" type="password" autocomplete="current-password" required />
+          <p id="unlockError" class="form-error" role="alert" hidden></p>
+          <button class="button primary" type="submit">解锁 15 分钟</button>
+        </form>
+      </section>
+    </div>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

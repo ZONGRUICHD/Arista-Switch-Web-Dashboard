@@ -1,643 +1,304 @@
-const http = require("node:http");
+"use strict";
+
+const crypto = require("node:crypto");
 const fs = require("node:fs/promises");
+const http = require("node:http");
 const path = require("node:path");
-const { Client: SshClient } = require("ssh2");
 
 const ROOT = __dirname;
-const PUBLIC_DIR = path.join(ROOT, "public");
-const DATA_DIR = path.join(ROOT, "data");
-const STATE_FILE = path.join(DATA_DIR, "state.json");
-const CONFIG_FILE = path.join(DATA_DIR, "config.json");
-const PORT = Number(process.env.PORT || 2480);
-
-const MIME_TYPES = {
+const WEB_DIR = path.join(ROOT, "web");
+const FIXTURE_FILE = path.join(ROOT, "data", "fixtures", "state.json");
+const HOST = "127.0.0.1";
+const PORT = parsePort(process.env.PORT || "3000");
+const SESSION_TTL = 12 * 60 * 60 * 1000;
+const UNLOCK_TTL = 15 * 60 * 1000;
+const PREVIEW_TTL = 5 * 60 * 1000;
+const BODY_LIMIT = 64 * 1024;
+const ROUTES = new Set(["/", "/ports", "/network", "/diagnostics", "/changes"]);
+const MIME = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
   ".svg": "image/svg+xml; charset=utf-8"
 };
+const DIAGNOSTIC_OUTPUT = {
+  version: "Arista DCS-7050QX-32S-F\nHardware version: 11.00\nSoftware image version: 4.28.6.1M (fixture)\nSerial number: PREVIEW-ONLY",
+  interfaces_status: "Port       Name                    Status       Vlan   Duplex Speed\nEt1/1      compute-a01             connected    10     full   10G\nEt1/4      compute-a04             connected    10     full   10G\nEt5        storage uplink          notconnect   20     full   40G",
+  vlan: "VLAN  Name       Status    Ports\n1     default    active    Et4\n10    COMPUTE    active    Et1/1-4\n20    STORAGE    active    Et5",
+  lldp: "Port      Neighbor Device  Neighbor Port\nEt2       spine-01         Ethernet9\nEt3       spine-02         Ethernet9",
+  environment: "System temperature status is: Ok\nAll fans are Ok\nPowerSupply1 Ok\nPowerSupply2 Ok",
+  routes: "VRF: default\nC  192.0.2.0/31 is directly connected, Ethernet2\nB  203.0.113.0/24 via 192.0.2.1",
+  arp: "Address         Age       Hardware Addr      Interface\n192.0.2.11     0:03:12   001c.73aa.0011     Vlan10",
+  mac_table: "Vlan  Mac Address       Type      Ports\n10    001c.73aa.0011    DYNAMIC   Et2\n10    5254.0091.2a01    DYNAMIC   Et1/1",
+  transceivers: "Port  Type          Vendor   Temperature  Tx Power  Rx Power\nEt3   40GBASE-SR4   Finisar  43.7 C       -2.1 dBm  -2.8 dBm"
+};
 
-const BLOCKED_COMMANDS = [
-  "configure",
-  "conf",
-  "enable",
-  "reload",
-  "reboot",
-  "write",
-  "copy",
-  "delete",
-  "erase",
-  "bash",
-  "sudo",
-  "install"
-];
+const sessions = new Map();
+let fixtureState;
+
+function parsePort(value) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1 || number > 65535) throw new Error("PORT must be between 1 and 65535.");
+  return number;
+}
+
+function token(bytes = 24) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
 
 function nowIso() {
   return new Date().toISOString();
 }
 
-function defaultPorts() {
-  const qsfp = Array.from({ length: 32 }, (_, index) => ({
-    id: index + 1,
-    name: `Ethernet${index + 1}`,
-    role: index < 24 ? "leaf/server" : "spine/uplink",
-    media: "QSFP+",
-    speed: "40G",
-    status: index % 7 === 0 ? "down" : "up",
-    vlan: index < 24 ? "trunk" : "routed",
-    description: index < 24 ? `Server rack ${String(index + 1).padStart(2, "0")}` : `Fabric link ${index - 23}`,
-    rxMbps: index % 7 === 0 ? 0 : 1180 + index * 43,
-    txMbps: index % 7 === 0 ? 0 : 960 + index * 39,
-    errors: index % 13 === 0 ? 2 : 0
-  }));
-
-  const sfp = Array.from({ length: 4 }, (_, index) => ({
-    id: index + 33,
-    name: `Ethernet${index + 33}`,
-    role: "management/uplink",
-    media: "SFP+",
-    speed: "10G",
-    status: index === 3 ? "down" : "up",
-    vlan: index === 0 ? "mgmt" : "trunk",
-    description: `10G uplink ${index + 1}`,
-    rxMbps: index === 3 ? 0 : 280 + index * 61,
-    txMbps: index === 3 ? 0 : 240 + index * 55,
-    errors: 0
-  }));
-
-  return [...qsfp, ...sfp];
-}
-
-function defaultState() {
+function securityHeaders(extra = {}) {
   return {
-    device: {
-      model: "Arista DCS-7050QX-32S-F",
-      hostname: "arista-7050qx",
-      serial: "LOCAL-SIM",
-      eosVersion: "模拟模式",
-      uptime: "未连接真实设备",
-      switchingCapacity: "2.56 Tbps",
-      forwardingRate: "1.44 Bpps",
-      airflow: "Front-to-back",
-      lastRefresh: nowIso(),
-      source: "local"
-    },
-    health: {
-      cpu: 18,
-      memory: 42,
-      temperature: 38,
-      fanStatus: "OK",
-      psuStatus: "1+1 OK"
-    },
-    ports: defaultPorts(),
-    events: [
-      {
-        time: nowIso(),
-        level: "info",
-        message: "本地后台已初始化，尚未连接 Arista eAPI。"
-      }
-    ]
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    ...extra
   };
 }
 
-function defaultConfig() {
-  return {
-    enabled: false,
-    mode: "ssh",
-    protocol: "http",
-    host: "",
-    port: 22,
-    username: "",
-    password: "",
-    commandFormat: "json",
-    updatedAt: nowIso()
-  };
-}
-
-async function ensureDataFiles() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await ensureFile(STATE_FILE, defaultState());
-  await ensureFile(CONFIG_FILE, defaultConfig());
-}
-
-async function ensureFile(file, value) {
-  try {
-    await fs.access(file);
-  } catch {
-    await fs.writeFile(file, JSON.stringify(value, null, 2), "utf8");
-  }
-}
-
-async function readJson(file, fallback) {
-  try {
-    const content = await fs.readFile(file, "utf8");
-    return JSON.parse(content);
-  } catch {
-    return fallback;
-  }
-}
-
-async function writeJson(file, value) {
-  await fs.writeFile(file, JSON.stringify(value, null, 2), "utf8");
-}
-
-function sanitizeConfig(config) {
-  return {
-    enabled: Boolean(config.enabled),
-    mode: config.mode || "ssh",
-    protocol: config.protocol || "http",
-    host: config.host || "",
-    port: Number(config.port || ((config.mode || "ssh") === "ssh" ? 22 : 80)),
-    username: config.username || "",
-    hasPassword: Boolean(config.password),
-    updatedAt: config.updatedAt || null
-  };
-}
-
-function json(res, status, payload) {
-  res.writeHead(status, {
+function sendJson(res, status, payload, headers = {}) {
+  const body = Buffer.from(JSON.stringify(payload));
+  res.writeHead(status, securityHeaders({
     "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store"
-  });
-  res.end(JSON.stringify(payload));
+    "Content-Length": String(body.length),
+    ...headers
+  }));
+  res.end(body);
 }
 
-function text(res, status, payload) {
-  res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8" });
+function sendText(res, status, body, contentType = "text/plain; charset=utf-8") {
+  const payload = Buffer.isBuffer(body) ? body : Buffer.from(String(body));
+  res.writeHead(status, securityHeaders({ "Content-Type": contentType, "Content-Length": String(payload.length) }));
   res.end(payload);
 }
 
 async function readBody(req) {
-  let body = "";
+  const chunks = [];
+  let size = 0;
   for await (const chunk of req) {
-    body += chunk;
-    if (body.length > 1024 * 1024) {
-      throw new Error("请求体过大");
-    }
+    size += chunk.length;
+    if (size > BODY_LIMIT) throw apiError(413, "request_too_large", "请求体超过 64 KiB。Preview 服务已拒绝该请求。");
+    chunks.push(chunk);
   }
-  return body ? JSON.parse(body) : {};
-}
-
-function isReadOnlyCommand(command) {
-  const normalized = command.trim().toLowerCase();
-  if (!normalized) return false;
-  if (BLOCKED_COMMANDS.some((blocked) => normalized === blocked || normalized.startsWith(`${blocked} `))) {
-    return false;
+  if (!chunks.length) return {};
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw apiError(400, "invalid_json", "请求体不是有效 JSON。");
   }
-  return /^(show|ping|traceroute|traceroute6|dir|more)\b/.test(normalized);
 }
 
-function eapiUrl(config) {
-  const protocol = config.protocol === "https" ? "https" : "http";
-  const host = String(config.host || "").trim();
-  const port = Number(config.port || (protocol === "https" ? 443 : 80));
-  return `${protocol}://${host}:${port}/command-api`;
+function apiError(status, code, message) {
+  const error = new Error(message);
+  error.status = status;
+  error.code = code;
+  return error;
 }
 
-async function runEapiCommands(config, commands, format = "json") {
-  if (!config.enabled || !config.host || !config.username || !config.password) {
-    throw new Error("尚未配置 eAPI 连接。");
+function cookieMap(req) {
+  return Object.fromEntries(String(req.headers.cookie || "").split(";").map((item) => item.trim()).filter(Boolean).map((item) => {
+    const index = item.indexOf("=");
+    return index < 0 ? [item, ""] : [item.slice(0, index), decodeURIComponent(item.slice(index + 1))];
+  }));
+}
+
+function currentSession(req) {
+  const id = cookieMap(req).preview_session;
+  const session = id ? sessions.get(id) : null;
+  if (!session) return null;
+  if (session.expiresAt <= Date.now()) {
+    sessions.delete(id);
+    return null;
   }
+  return session;
+}
 
-  const auth = Buffer.from(`${config.username}:${config.password}`).toString("base64");
-  const response = await fetch(eapiUrl(config), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Basic ${auth}`
-    },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "runCmds",
-      params: {
-        version: 1,
-        cmds: commands,
-        format
-      },
-      id: `console-${Date.now()}`
-    })
-  });
+function requireSession(req) {
+  const session = currentSession(req);
+  if (!session) throw apiError(401, "authentication_required", "Preview 会话未登录。");
+  return session;
+}
 
-  const payload = await response.json().catch(() => null);
-  if (!response.ok) {
-    throw new Error(`eAPI HTTP ${response.status}: ${JSON.stringify(payload)}`);
+function requireCsrf(req, session) {
+  const supplied = String(req.headers["x-csrf-token"] || "");
+  const suppliedBytes = Buffer.from(supplied);
+  const expectedBytes = Buffer.from(session.csrfToken);
+  if (!supplied || suppliedBytes.length !== expectedBytes.length || !crypto.timingSafeEqual(suppliedBytes, expectedBytes)) {
+    throw apiError(403, "csrf_failed", "CSRF token 无效。");
   }
-  if (payload && payload.error) {
-    throw new Error(payload.error.message || JSON.stringify(payload.error));
-  }
-  return payload ? payload.result : [];
 }
 
-function runSshCommand(config, command) {
-  return new Promise((resolve, reject) => {
-    if (!config.enabled || !config.host || !config.username || !config.password) {
-      reject(new Error("SSH connection is not configured."));
-      return;
-    }
-
-    const conn = new SshClient();
-    const timeout = setTimeout(() => {
-      conn.end();
-      reject(new Error("SSH command timed out."));
-    }, 20000);
-
-    conn
-      .on("ready", () => {
-        conn.exec(command, (error, stream) => {
-          if (error) {
-            clearTimeout(timeout);
-            conn.end();
-            reject(error);
-            return;
-          }
-
-          let stdout = "";
-          let stderr = "";
-          stream
-            .on("close", (code) => {
-              clearTimeout(timeout);
-              conn.end();
-              if (code && stderr.trim()) {
-                reject(new Error(stderr.trim()));
-                return;
-              }
-              resolve(stdout.trim() || stderr.trim());
-            })
-            .on("data", (data) => {
-              stdout += data.toString("utf8");
-            })
-            .stderr.on("data", (data) => {
-              stderr += data.toString("utf8");
-            });
-        });
-      })
-      .on("keyboard-interactive", (_name, _instructions, _lang, _prompts, finish) => {
-        finish([config.password]);
-      })
-      .on("error", (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      })
-      .connect({
-        host: String(config.host || "").trim(),
-        port: Number(config.port || 22),
-        username: config.username,
-        password: config.password,
-        tryKeyboard: true,
-        readyTimeout: 15000
-      });
-  });
+function publicSession(session) {
+  return session ? {
+    authenticated: true,
+    user: session.user,
+    csrfToken: session.csrfToken,
+    expiresAt: new Date(session.expiresAt).toISOString(),
+    unlockedUntil: session.unlockedUntil ? new Date(session.unlockedUntil).toISOString() : null
+  } : { authenticated: false };
 }
 
-async function runSshCommands(config, commands) {
-  const results = [];
-  for (const command of commands) {
-    results.push(await runSshCommand(config, command));
-  }
-  return results;
+function cloneFixture() {
+  const state = structuredClone(fixtureState);
+  const now = Date.now();
+  const wave = Math.sin(now / 11_000);
+  state.device.lastRefresh = nowIso();
+  state.health.cpu = Math.round(13 + wave * 3);
+  state.traffic.rxMbps = Math.round((18_540 + wave * 840) * 10) / 10;
+  state.traffic.txMbps = Math.round((14_721 - wave * 620) * 10) / 10;
+  const latest = state.history.traffic[state.history.traffic.length - 1];
+  latest.time = state.device.lastRefresh;
+  latest.rxMbps = state.traffic.rxMbps;
+  latest.txMbps = state.traffic.txMbps;
+  return state;
 }
 
-function normalizeInterfaceName(name) {
-  const match = String(name || "").match(/^(?:Et|Ethernet)(\d+)$/i);
-  return match ? `Ethernet${match[1]}` : name;
+function diagnosticOutput(commandId, target) {
+  if (commandId === "ping") return `PING ${target} (fixture)\n64 bytes from ${target}: icmp_seq=1 ttl=64 time=0.428 ms\n64 bytes from ${target}: icmp_seq=2 ttl=64 time=0.391 ms\n\n2 packets transmitted, 2 received, 0% packet loss`;
+  if (commandId === "traceroute") return `traceroute to ${target} (fixture), 8 hops max\n 1  192.0.2.1  0.421 ms  0.407 ms  0.395 ms\n 2  ${target}  0.817 ms  0.803 ms  0.798 ms`;
+  return DIAGNOSTIC_OUTPUT[commandId];
 }
 
-function parseSshVersion(output) {
-  const version = {};
-  const serialMatch = output.match(/Serial number:\s*(\S+)/i);
-  const versionMatch = output.match(/(?:Software image version|EOS version|Version):\s*([^\r\n]+)/i);
-  if (serialMatch) version.serialNumber = serialMatch[1];
-  if (versionMatch) version.version = versionMatch[1].trim();
-  return version;
+function validateTarget(value) {
+  const target = String(value || "").trim();
+  if (!target || target.length > 253 || !/^[A-Za-z0-9:._-]+$/.test(target)) throw apiError(400, "invalid_target", "目标只允许 IP 地址或安全主机名字符。");
+  return target;
 }
 
-function parseSshInterfacesStatus(output, fallbackPorts) {
-  const ports = (fallbackPorts || defaultPorts()).map((port) => ({ ...port }));
-  const byName = new Map(ports.map((port) => [port.name.toLowerCase(), port]));
-
-  for (const line of String(output || "").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    const firstToken = trimmed.split(/\s+/)[0];
-    const normalized = normalizeInterfaceName(firstToken);
-    const port = byName.get(String(normalized).toLowerCase());
-    if (!port) continue;
-
-    const tokens = trimmed.split(/\s+/);
-    const statusIndex = tokens.findIndex((token) => /^(connected|notconnect|disabled|errdisabled|inactive)$/i.test(token));
-    if (statusIndex >= 0) {
-      port.status = /^connected$/i.test(tokens[statusIndex]) ? "up" : "down";
-      port.vlan = tokens[statusIndex + 1] || port.vlan;
-    }
-
-    const speed = tokens.find((token) => /^(?:auto|10G|40G|1000M|100M|10M)$/i.test(token));
-    if (speed && !/^auto$/i.test(speed)) port.speed = speed.toUpperCase();
-    port.rxMbps = port.status === "up" ? port.rxMbps : 0;
-    port.txMbps = port.status === "up" ? port.txMbps : 0;
-  }
-
-  return ports;
-}
-
-function parseInterfacesStatus(result) {
-  const source = result && (result.interfaceStatuses || result.interfaces || result);
-  if (!source || typeof source !== "object") return null;
-
-  const ports = defaultPorts();
-  const byName = new Map(ports.map((port) => [port.name.toLowerCase(), port]));
-
-  for (const [name, details] of Object.entries(source)) {
-    const normalized = name.toLowerCase().replace(/^et/, "ethernet");
-    const port = byName.get(normalized);
-    if (!port || !details || typeof details !== "object") continue;
-
-    const link = String(details.linkStatus || details.lineProtocolStatus || details.interfaceStatus || "").toLowerCase();
-    const speed = details.bandwidth ? `${Math.round(Number(details.bandwidth) / 1000000000)}G` : details.speed || port.speed;
-
-    port.status = link.includes("up") || link === "connected" ? "up" : "down";
-    port.description = details.description || port.description;
-    port.speed = String(speed || port.speed).toUpperCase();
-    port.vlan = details.vlanInformation?.interfaceMode || details.vlanId || port.vlan;
-    port.rxMbps = Number(port.status === "up" ? port.rxMbps : 0);
-    port.txMbps = Number(port.status === "up" ? port.txMbps : 0);
-  }
-
-  return ports;
-}
-
-function deriveHealth(environmentResult) {
-  const textDump = JSON.stringify(environmentResult || {});
-  const hasFault = /fail|fault|bad|overheat/i.test(textDump);
-  return {
-    cpu: 20,
-    memory: 45,
-    temperature: hasFault ? 58 : 40,
-    fanStatus: hasFault ? "CHECK" : "OK",
-    psuStatus: hasFault ? "CHECK" : "1+1 OK"
+function previewCommands(action, params) {
+  const item = (name, fallback = "<required>") => String(params?.[name] || fallback);
+  const commands = {
+    interface_admin: [`interface ${item("interface")}`, item("state") === "disable" ? "shutdown" : "no shutdown"],
+    poe_control: [`interface ${item("interface")}`, item("state") === "disable" ? "poe disable" : "poe enable"],
+    description: [`interface ${item("interface")}`, `description ${item("description")}`],
+    access_vlan: [`interface ${item("interface")}`, "switchport mode access", `switchport access vlan ${item("vlan")}`],
+    trunk_vlan: [`interface ${item("interface")}`, "switchport mode trunk", `switchport trunk allowed vlan ${item("vlan")}`, ...(params?.nativeVlan ? [`switchport trunk native vlan ${params.nativeVlan}`] : [])],
+    create_vlan: [`vlan ${item("vlan")}`, ...(params?.name ? [`name ${params.name}`] : [])],
+    svi_interface: [`interface Vlan${item("vlan")}`, `ip address ${item("address")}`, ...(params?.description ? [`description ${params.description}`] : [])],
+    l3_interface: [`interface ${item("interface")}`, "no switchport", `ip address ${item("address")}`],
+    ospf_network: [`router ospf ${item("process", "1")}`, `network ${item("network")} area ${item("area", "0")}`],
+    ospf_interface: [`interface ${item("interface")}`, `ip ospf area ${item("area", "0")}`],
+    bgp_neighbor: [`router bgp ${item("asn")}`, `neighbor ${item("neighbor")} remote-as ${item("remoteAs")}`],
+    bgp_address_family: [`router bgp ${item("asn")}`, `address-family ${item("addressFamily", "ipv4")}`, `${item("mode", "activate") === "deactivate" ? "no " : ""}neighbor ${item("neighbor")} activate`],
+    save_config: ["write memory"]
   };
-}
-
-async function refreshFromSsh(config, state) {
-  const result = await runSshCommands(config, [
-    "show version",
-    "show hostname",
-    "show uptime",
-    "show interfaces status",
-    "show environment all"
-  ]);
-
-  const version = parseSshVersion(result[0] || "");
-  const hostnameOutput = String(result[1] || "").trim();
-  const uptimeOutput = String(result[2] || "").trim();
-  const parsedPorts = parseSshInterfacesStatus(result[3] || "", state.ports || defaultPorts());
-
-  const nextState = {
-    ...state,
-    device: {
-      ...state.device,
-      hostname: hostnameOutput.split(/\r?\n/).pop() || state.device.hostname,
-      serial: version.serialNumber || state.device.serial,
-      eosVersion: version.version || state.device.eosVersion,
-      uptime: uptimeOutput.split(/\r?\n/).find((line) => /uptime/i.test(line)) || uptimeOutput || state.device.uptime,
-      lastRefresh: nowIso(),
-      source: "ssh"
-    },
-    health: deriveHealth(result[4]),
-    ports: parsedPorts,
-    events: [
-      {
-        time: nowIso(),
-        level: "success",
-        message: `Refreshed device state from ${config.host} over SSH.`
-      },
-      ...(state.events || [])
-    ].slice(0, 50)
-  };
-
-  await writeJson(STATE_FILE, nextState);
-  return nextState;
-}
-
-async function refreshFromDevice() {
-  const config = await readJson(CONFIG_FILE, defaultConfig());
-  const state = await readJson(STATE_FILE, defaultState());
-
-  if ((config.mode || "ssh") === "ssh") {
-    return refreshFromSsh(config, state);
-  }
-
-  const result = await runEapiCommands(config, [
-    "show version",
-    "show hostname",
-    "show uptime",
-    "show interfaces status",
-    "show environment all"
-  ]);
-
-  const version = result[0] || {};
-  const hostname = result[1] || {};
-  const uptime = result[2] || {};
-  const parsedPorts = parseInterfacesStatus(result[3]) || state.ports || defaultPorts();
-
-  const nextState = {
-    ...state,
-    device: {
-      ...state.device,
-      hostname: hostname.hostname || version.hostname || state.device.hostname,
-      serial: version.serialNumber || state.device.serial,
-      eosVersion: version.version || state.device.eosVersion,
-      uptime: uptime.upTime || uptime.uptime || state.device.uptime,
-      lastRefresh: nowIso(),
-      source: "eapi"
-    },
-    health: deriveHealth(result[4]),
-    ports: parsedPorts,
-    events: [
-      {
-        time: nowIso(),
-        level: "success",
-        message: `已从 ${config.host} 刷新设备状态。`
-      },
-      ...(state.events || [])
-    ].slice(0, 50)
-  };
-
-  await writeJson(STATE_FILE, nextState);
-  return nextState;
-}
-
-function updateMockState(state) {
-  const tick = Date.now() / 1000;
-  return {
-    ...state,
-    device: {
-      ...state.device,
-      lastRefresh: nowIso(),
-      source: state.device.source || "local"
-    },
-    health: {
-      ...state.health,
-      cpu: Math.max(8, Math.min(86, Math.round(20 + Math.sin(tick / 13) * 6))),
-      memory: Math.max(20, Math.min(90, Math.round(43 + Math.cos(tick / 17) * 4))),
-      temperature: Math.max(28, Math.min(72, Math.round(39 + Math.sin(tick / 19) * 3)))
-    },
-    ports: (state.ports || defaultPorts()).map((port, index) => {
-      if (port.status !== "up") return { ...port, rxMbps: 0, txMbps: 0 };
-      const wave = Math.abs(Math.sin(tick / 8 + index));
-      return {
-        ...port,
-        rxMbps: Math.round(300 + wave * (port.speed === "40G" ? 3600 : 900)),
-        txMbps: Math.round(260 + (1 - wave / 2) * (port.speed === "40G" ? 2800 : 760))
-      };
-    })
-  };
+  if (!commands[action]) throw apiError(400, "unsupported_action", "Preview fixture 不支持该配置操作。");
+  return commands[action];
 }
 
 async function handleApi(req, res, pathname) {
+  if (req.method === "GET" && pathname === "/healthz") {
+    return sendJson(res, 200, { ok: true, status: "healthy", version: "fixture-preview", commit: "local" });
+  }
+  if (req.method === "GET" && pathname === "/api/auth/session") {
+    return sendJson(res, 200, { ok: true, ...publicSession(currentSession(req)) });
+  }
+  if (req.method === "POST" && pathname === "/api/auth/login") {
+    const body = await readBody(req);
+    if (!String(body.username || "").trim() || !String(body.password || "")) throw apiError(401, "invalid_credentials", "Preview 登录需要非空用户名和密码。");
+    const id = token();
+    const session = { id, user: String(body.username).trim(), csrfToken: token(), expiresAt: Date.now() + SESSION_TTL, unlockedUntil: 0, previews: new Map() };
+    sessions.set(id, session);
+    return sendJson(res, 200, { ok: true, ...publicSession(session) }, { "Set-Cookie": `preview_session=${encodeURIComponent(id)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL / 1000}` });
+  }
+
+  const session = requireSession(req);
+  if (req.method !== "GET") requireCsrf(req, session);
+  if (req.method === "POST" && pathname === "/api/auth/logout") {
+    sessions.delete(session.id);
+    return sendJson(res, 200, { ok: true, authenticated: false }, { "Set-Cookie": "preview_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0" });
+  }
+  if (req.method === "POST" && pathname === "/api/auth/unlock") {
+    const body = await readBody(req);
+    if (!String(body.password || "")) throw apiError(401, "invalid_credentials", "密码不能为空。");
+    session.unlockedUntil = Date.now() + UNLOCK_TTL;
+    return sendJson(res, 200, { ok: true, ...publicSession(session) });
+  }
   if (req.method === "GET" && pathname === "/api/state") {
-    const state = updateMockState(await readJson(STATE_FILE, defaultState()));
-    const config = await readJson(CONFIG_FILE, defaultConfig());
-    return json(res, 200, { state, config: sanitizeConfig(config) });
+    return sendJson(res, 200, { ok: true, state: cloneFixture() });
   }
-
-  if (req.method === "POST" && pathname === "/api/settings") {
-    const input = await readBody(req);
-    const current = await readJson(CONFIG_FILE, defaultConfig());
-    const mode = input.mode === "eapi" ? "eapi" : "ssh";
-    const protocol = input.protocol === "https" ? "https" : "http";
-    const defaultPort = mode === "ssh" ? 22 : protocol === "https" ? 443 : 80;
-    const next = {
-      enabled: Boolean(input.enabled),
-      mode,
-      protocol,
-      host: String(input.host || "").trim(),
-      port: Number(input.port || defaultPort),
-      username: String(input.username || "").trim(),
-      password: input.password ? String(input.password) : current.password,
-      commandFormat: "json",
-      updatedAt: nowIso()
-    };
-
-    await writeJson(CONFIG_FILE, next);
-    return json(res, 200, { ok: true, config: sanitizeConfig(next) });
-  }
-
   if (req.method === "POST" && pathname === "/api/refresh") {
-    const config = await readJson(CONFIG_FILE, defaultConfig());
-    if (!config.enabled) {
-      const state = updateMockState(await readJson(STATE_FILE, defaultState()));
-      await writeJson(STATE_FILE, state);
-      return json(res, 200, { ok: true, state, mode: "local" });
-    }
-
-    try {
-      const state = await refreshFromDevice();
-      return json(res, 200, { ok: true, state, mode: config.mode || "ssh" });
-    } catch (error) {
-      const state = await readJson(STATE_FILE, defaultState());
-      state.events = [
-        {
-          time: nowIso(),
-          level: "error",
-          message: `刷新失败：${error.message}`
-        },
-        ...(state.events || [])
-      ].slice(0, 50);
-      await writeJson(STATE_FILE, state);
-      return json(res, 502, { ok: false, error: error.message, state });
-    }
+    const body = await readBody(req);
+    if (!new Set(["core", "metrics", "health", "tables", "discovery", "optics", "protocols", "extras", "full"]).has(body.scope || "full")) throw apiError(400, "invalid_scope", "未知刷新范围。");
+    await new Promise((resolve) => setTimeout(resolve, 45));
+    return sendJson(res, 200, { ok: true, state: cloneFixture(), scope: body.scope || "full" });
   }
-
-  if (req.method === "POST" && pathname === "/api/command") {
-    const input = await readBody(req);
-    const command = String(input.command || "").trim();
-    if (!isReadOnlyCommand(command)) {
-      return json(res, 400, {
-        ok: false,
-        error: "只允许只读命令：show / ping / traceroute / dir / more。配置、重启、删除类命令已拦截。"
-      });
-    }
-
-    const config = await readJson(CONFIG_FILE, defaultConfig());
-    if (!config.enabled) {
-      return json(res, 200, {
-        ok: true,
-        command,
-        mode: "local",
-        output: `模拟输出\n> ${command}\n当前未启用 eAPI，后台运行在本地模拟模式。请在“连接”里填写交换机管理地址后再执行真实查询。`
-      });
-    }
-
-    try {
-      if ((config.mode || "ssh") === "ssh") {
-        const output = await runSshCommand(config, command);
-        return json(res, 200, {
-          ok: true,
-          command,
-          mode: "ssh",
-          output
-        });
-      }
-
-      const result = await runEapiCommands(config, [command], "text");
-      return json(res, 200, {
-        ok: true,
-        command,
-        mode: "eapi",
-        output: result[0] && (result[0].output || result[0])
-      });
-    } catch (error) {
-      return json(res, 502, { ok: false, command, error: error.message });
-    }
+  if (req.method === "POST" && pathname === "/api/diagnostics") {
+    const body = await readBody(req);
+    const commandId = String(body.commandId || "");
+    const target = ["ping", "traceroute"].includes(commandId) ? validateTarget(body.params?.target) : "";
+    const output = diagnosticOutput(commandId, target);
+    if (!output) throw apiError(400, "unknown_diagnostic", "未知诊断 ID。");
+    return sendJson(res, 200, { ok: true, commandId, output });
   }
-
-  return json(res, 404, { ok: false, error: "API 不存在" });
+  if (req.method === "POST" && pathname === "/api/config/preview") {
+    const body = await readBody(req);
+    const action = String(body.action || "");
+    const commands = previewCommands(action, body.params || {});
+    const previewToken = token();
+    const preview = { previewToken, action, commands, expiresAt: Date.now() + PREVIEW_TTL };
+    session.previews.set(previewToken, preview);
+    return sendJson(res, 200, {
+      ok: true, previewToken, baselineHash: "fixture-baseline-001", commands,
+      diff: `--- before-running-config\n+++ candidate-config\n${commands.map((command) => `+ ${command}`).join("\n")}`,
+      expiresAt: new Date(preview.expiresAt).toISOString()
+    });
+  }
+  if (req.method === "POST" && pathname === "/api/config/apply") {
+    if (session.unlockedUntil <= Date.now()) throw apiError(423, "operations_locked", "配置操作尚未解锁。");
+    const body = await readBody(req);
+    const preview = session.previews.get(String(body.previewToken || ""));
+    if (!preview || preview.expiresAt <= Date.now()) throw apiError(409, "preview_expired", "预览不存在或已过期。");
+    session.previews.delete(preview.previewToken);
+    return sendJson(res, 200, { ok: true, action: preview.action, commands: preview.commands, diff: "Fixture preview only — no switch configuration changed.", output: "模拟 configuration session 已提交。" });
+  }
+  if (req.method === "POST" && ["/api/command", "/api/config"].includes(pathname)) {
+    return sendJson(res, 410, { ok: false, code: "endpoint_removed", error: "该旧接口已移除。" });
+  }
+  throw apiError(404, "not_found", "API 不存在。");
 }
 
-async function serveStatic(req, res, pathname) {
-  const safePath = pathname === "/" ? "/index.html" : pathname;
-  const filePath = path.normalize(path.join(PUBLIC_DIR, safePath));
-
-  if (!filePath.startsWith(PUBLIC_DIR)) {
-    return text(res, 403, "Forbidden");
-  }
-
-  try {
-    const content = await fs.readFile(filePath);
-    const ext = path.extname(filePath);
-    res.writeHead(200, {
-      "Content-Type": MIME_TYPES[ext] || "application/octet-stream",
-      "Cache-Control": "no-store"
-    });
-    res.end(content);
-  } catch {
-    text(res, 404, "Not found");
-  }
+async function serveWeb(res, pathname) {
+  const asset = ROUTES.has(pathname) ? "index.html" : pathname === "/app.js" ? "app.js" : pathname === "/styles.css" ? "styles.css" : null;
+  if (!asset) return sendText(res, 404, "Not found");
+  const body = await fs.readFile(path.join(WEB_DIR, asset));
+  return sendText(res, 200, body, MIME[path.extname(asset)] || "application/octet-stream");
 }
 
 async function handleRequest(req, res) {
+  const requestId = token(9);
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname.startsWith("/api/")) {
-      return await handleApi(req, res, url.pathname);
-    }
-    return await serveStatic(req, res, url.pathname);
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    if (url.pathname === "/healthz" || url.pathname.startsWith("/api/")) await handleApi(req, res, url.pathname);
+    else if (req.method === "GET" || req.method === "HEAD") await serveWeb(res, url.pathname);
+    else throw apiError(405, "method_not_allowed", "Method not allowed.");
   } catch (error) {
-    return json(res, 500, { ok: false, error: error.message });
+    if (res.headersSent) return res.end();
+    sendJson(res, error.status || 500, { ok: false, code: error.code || "internal_error", error: error.status ? error.message : "Preview 服务发生内部错误。", requestId });
   }
 }
 
-ensureDataFiles()
-  .then(() => {
-    http.createServer(handleRequest).listen(PORT, () => {
-      console.log("");
-      console.log("Arista 7050QX Web 后台已启动");
-      console.log(`访问地址: http://localhost:${PORT}`);
-      console.log("停止服务: Ctrl + C");
-      console.log("");
-    });
-  })
-  .catch((error) => {
-    console.error("启动失败:", error);
-    process.exit(1);
+async function main() {
+  fixtureState = JSON.parse(await fs.readFile(FIXTURE_FILE, "utf8"));
+  const server = http.createServer(handleRequest);
+  server.listen(PORT, HOST, () => {
+    console.log(`Arista dashboard fixture preview: http://${HOST}:${PORT}`);
+    console.log("Preview login accepts any non-empty username and password. No remote device is contacted.");
   });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of sessions) if (session.expiresAt <= now) sessions.delete(id);
+}, 60_000).unref();
+
+main().catch((error) => {
+  console.error("Preview failed to start:", error.message);
+  process.exitCode = 1;
+});

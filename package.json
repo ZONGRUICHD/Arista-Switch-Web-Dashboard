@@ -1,17 +1,22 @@
 {
-  "name": "arista-7050qx-console-admin",
-  "version": "1.0.0",
+  "name": "arista-7050qx-dashboard-preview",
+  "version": "2.0.0",
   "private": true,
-  "description": "Local web admin console for Arista DCS-7050QX-32S-F.",
+  "description": "Local fixture preview and regression harness for the Arista on-box dashboard.",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
-    "test": "python -m unittest discover -s tests -v"
+    "preview": "node server.js",
+    "build:web": "python tools/build_onbox.py",
+    "check:web": "node --check web/app.js && node --check server.js && python tools/build_onbox.py --check",
+    "test": "python -m unittest discover -s tests -v",
+    "test:e2e": "playwright test",
+    "test:frontend": "node --check web/app.js && node --check server.js && playwright test"
   },
   "engines": {
     "node": ">=18"
   },
-  "dependencies": {
-    "ssh2": "^1.17.0"
+  "devDependencies": {
+    "@playwright/test": "^1.61.1"
   }
 }
