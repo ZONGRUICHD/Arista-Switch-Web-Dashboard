@@ -681,12 +681,14 @@ rollback_install() {
   elif [ "$auth_created" -eq 1 ]; then
     rm -f "$AUTH_CONFIG" || rollback_ok=0
   fi
-  if [ "$event_mutation_started" -eq 1 ]; then
-    if [ "$previous_managed" -eq 1 ]; then
+  if [ "$previous_managed" -eq 1 ]; then
+    if [ "$event_mutation_started" -eq 1 ]; then
       restore_event_handler || rollback_ok=0
-    else
-      disable_legacy_event_handler || rollback_ok=0
     fi
+  elif [ "$event_mutation_started" -eq 1 ] || \
+       [ "$production_stop_started" -eq 1 ] || \
+       [ "$application_replaced" -eq 1 ]; then
+    disable_legacy_event_handler || rollback_ok=0
   fi
   if [ "$production_was_running" -eq 1 ] && \
      { [ "$production_stop_started" -eq 1 ] || [ "$application_replaced" -eq 1 ]; } && \

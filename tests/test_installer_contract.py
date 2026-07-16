@@ -251,7 +251,14 @@ class InstallerContractTests(unittest.TestCase):
         rollback = self.function_text("rollback_install")
         disable = self.function_text("disable_legacy_event_handler")
         self.assertIn('disable_legacy_event_handler || rollback_ok=0', rollback)
-        self.assertRegex(rollback, r'(?s)if \[ "\$previous_managed" -eq 1 \]; then\s+restore_event_handler')
+        self.assertRegex(
+            rollback,
+            r'(?s)if \[ "\$previous_managed" -eq 1 \]; then\s+if \[ "\$event_mutation_started" -eq 1 \]; then\s+restore_event_handler',
+        )
+        self.assertRegex(
+            rollback,
+            r'(?s)elif \[ "\$event_mutation_started" -eq 1 \] \|\|.*\[ "\$production_stop_started" -eq 1 \] \|\|.*\[ "\$application_replaced" -eq 1 \]; then\s+disable_legacy_event_handler',
+        )
         self.assertIn('no event-handler $EVENT_HANDLER', disable)
         self.assertIn('write memory', disable)
         self.assertIn('[ ! -s "${event_verify_tmp}.actual" ]', disable)
@@ -288,6 +295,44 @@ class InstallerContractTests(unittest.TestCase):
             self.assertIn("legacy=1", result.stdout)
             self.assertIn("deliberately left stopped", result.stderr)
             self.assertFalse(marker.exists(), "legacy rollback must not execute the Python app")
+
+    def test_legacy_cutover_failure_disables_handler_before_configure_startup(self):
+        rollback = self.function_text("rollback_install")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            marker = root / "handler-disabled"
+            harness = "\n".join(
+                [
+                    'disable_legacy_event_handler() { : > %s; }' % shlex.quote(self.shell_path(marker)),
+                    rollback,
+                    "transaction_active=1",
+                    "production_stop_started=1",
+                    "application_replaced=0",
+                    "previous_managed=0",
+                    "event_mutation_started=0",
+                    "production_was_running=0",
+                    "wrapper_replaced=0",
+                    "release_replaced=0",
+                    "auth_created=0",
+                    "saved_auth=''",
+                    "backup=''",
+                    "saved_wrapper=''",
+                    "saved_release=''",
+                    "event_backup=''",
+                    "legacy_rollback_stopped=0",
+                    "preserve_recovery=0",
+                    "PID_FILE=%s" % shlex.quote(self.shell_path(root / "missing.pid")),
+                    "APP_PATH=%s" % shlex.quote(self.shell_path(root / "legacy.py")),
+                    "AUTH_CONFIG=%s" % shlex.quote(self.shell_path(root / "auth.json")),
+                    "WRAPPER_PATH=%s" % shlex.quote(self.shell_path(root / "wrapper.sh")),
+                    "RELEASE_FILE=%s" % shlex.quote(self.shell_path(root / "release")),
+                    "LOG=%s" % shlex.quote(self.shell_path(root / "log")),
+                    "rollback_install",
+                ]
+            )
+            result = self.run_shell(harness)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(marker.exists(), "legacy handler must be disabled after any cutover-side effect")
 
     def test_event_handler_mutation_captures_output_and_readback_verifies(self):
         capture = self.function_text("capture_event_handler")
