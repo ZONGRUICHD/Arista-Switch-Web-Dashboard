@@ -12,7 +12,7 @@ APP_URL="${APP_URL:-}"
 APP_SOURCE="${APP_SOURCE:-}"
 
 APP_PATH="${APP_PATH:-/mnt/flash/arista7050_web.py}"
-STATE_DIR="${STATE_DIR:-/mnt/flash/arista-dashboard}"
+STATE_DIR="${STATE_DIR:-/persist/secure/arista-dashboard}"
 AUTH_CONFIG="${AUTH_CONFIG:-$STATE_DIR/auth.json}"
 TLS_CERT="${TLS_CERT:-$STATE_DIR/dashboard.crt}"
 TLS_KEY="${TLS_KEY:-$STATE_DIR/dashboard.key}"
@@ -924,6 +924,7 @@ wrapper_tmp="${WRAPPER_PATH}.new.$$"
 cat > "$wrapper_tmp" <<EOF
 #!/usr/bin/env sh
 set -eu
+export WEB_DATA_DIR="$STATE_DIR"
 if [ -f "$LOG" ]; then
   size=\$(wc -c < "$LOG" | tr -d ' ')
   case "\$size" in ''|*[!0-9]*) size=0 ;; esac

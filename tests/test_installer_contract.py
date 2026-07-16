@@ -197,6 +197,11 @@ class InstallerContractTests(unittest.TestCase):
         self.assertLess(root_guard, main.index('mkdir -p "$STATE_DIR"'))
         self.assertLess(root_guard, main.index(': > "$LOG"'))
 
+    def test_secure_persistent_state_is_not_stored_on_vfat_flash(self):
+        self.assertIn('STATE_DIR="${STATE_DIR:-/persist/secure/arista-dashboard}"', self.script)
+        self.assertIn('export WEB_DATA_DIR="$STATE_DIR"', self.script)
+        self.assertNotIn('STATE_DIR="${STATE_DIR:-/mnt/flash', self.script)
+
     def test_legacy_rollback_deliberately_leaves_http_app_stopped(self):
         restart = self.function_text("restart_previous")
         self.assertIn('sh "$WRAPPER_PATH"', restart)

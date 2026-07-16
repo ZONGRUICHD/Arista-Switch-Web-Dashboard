@@ -101,7 +101,7 @@ APP_SOURCE=/tmp/arista7050-web-reviewed.py \
 
 1. 检查 Python、OpenSSL、下载工具、写权限和至少 8 MiB 可用空间。
 2. 下载固定 commit 的产物并验证显式 SHA-256，随后进行 Python 编译检查。
-3. 在 `/mnt/flash/arista-dashboard/` 生成权限为 `0600` 的认证配置和自签名 RSA 证书。证书 SAN 默认包含 `192.168.0.248` 和 `Arista7050`。
+3. 在 EOS 的安全持久目录 `/persist/secure/arista-dashboard/` 生成权限为 `0600` 的认证配置和自签名 RSA 证书。证书 SAN 默认包含 `192.168.0.248` 和 `Arista7050`。应用产物与有限备份仍位于 flash，避免把私钥放到不支持 POSIX 权限的 VFAT 文件系统。
 4. 通过原子安装锁阻止并发安装，清理经过 PID 和 argv 验证的遗留候选进程，再在 `127.0.0.1:2481` 启动隔离候选实例。候选的历史和审计数据使用独立临时路径，不读取、迁移或改写正式数据。安装器先通过 HTTPS `/healthz` 核对 commit 和产物摘要，再从 `/dev/tty` 重新读取密码，在单独的 Python 进程内实际验证登录、Secure Cookie、CSRF 会话、核心状态 API 和注销。密码不会进入 argv、环境变量、文件或日志。端口已被无法验证的进程占用时安全退出，不会盲目删除 PID 文件。
 5. 只通过受验证的 PID 文件停止旧服务，原子替换生产文件，并验证正式 `2480` 实例。
 6. 写入持久启动包装器和 EOS `codex-webui-start` on-boot event-handler。安装过程中不会重启交换机。
@@ -134,7 +134,7 @@ sudo -n env REF="$REF" ARTIFACT_SHA="$ARTIFACT_SHA" LEGACY_PID=<verified-pid> \
 | `STARTUP` | `1` | 设为 `0`/`false`/`no` 时不修改 EOS on-boot handler |
 | `MIN_FREE_KB` | `8192` | 部署前最低可用闪存空间 |
 | `MAX_LOG_BYTES` | `2097152` | 启动时轮转日志的大小阈值；只保留 `.1` |
-| `STATE_DIR` | `/mnt/flash/arista-dashboard` | 密钥、认证、PID、包装器和日志目录 |
+| `STATE_DIR` | `/persist/secure/arista-dashboard` | 权限为 `0700` 的安全持久目录；保存密钥、认证、PID、包装器、历史、审计和日志 |
 | `INSTALL_LOCK` | `$STATE_DIR/install.lock` | 安装器并发锁目录；仅自动清除确认没有存活 owner PID 的旧锁 |
 
 布尔变量只接受表中列出的真值以及对应的 `0`/`false`/`no`，拼写错误会直接失败。路径及标识符仅允许安全字符，避免把未经转义的内容写入启动脚本或 EOS 配置。
@@ -150,9 +150,9 @@ https://192.168.0.248:2480/
 浏览器会提示自签名证书不受信任。先在交换机控制台核对 SHA-256 指纹：
 
 ```sh
-openssl x509 -in /mnt/flash/arista-dashboard/dashboard.crt \
+openssl x509 -in /persist/secure/arista-dashboard/dashboard.crt \
   -noout -subject -fingerprint -sha256
-openssl x509 -in /mnt/flash/arista-dashboard/dashboard.crt -noout -text \
+openssl x509 -in /persist/secure/arista-dashboard/dashboard.crt -noout -text \
   | sed -n '/Subject Alternative Name/{n;p;}'
 ```
 
@@ -174,7 +174,7 @@ sudo -n env REF="$REF" ARTIFACT_SHA="$ARTIFACT_SHA" ROTATE_AUTH=1 \
 当前固定版本可在交换机上查看：
 
 ```sh
-cat /mnt/flash/arista-dashboard/release
+sudo -n cat /persist/secure/arista-dashboard/release
 ```
 
 ## 回滚与运维
@@ -182,8 +182,8 @@ cat /mnt/flash/arista-dashboard/release
 - 部署失败时安装器自动回滚；无需也不应重启交换机。从无认证 HTTP 旧版首次迁移失败时，旧文件会恢复但旧网络服务不会自动重启。
 - 已完成部署需要回退时，继续使用当前已审核的安装器脚本，把 `REF`、`ARTIFACT_SHA` 和（如需覆盖）`APP_URL` 指向目标旧产物。不要改为执行旧 commit 中可能缺少安全检查的 `install.sh`。目标旧产物仍须支持当前的 HTTPS、认证、PID 和版本参数，否则候选验证会安全失败；跨不兼容版本应先在实验环境验证。
 - 应用备份位于 `/mnt/flash/arista7050_web.py.bak.<UTC timestamp>.<installer PID>`，最多保留最近两份。
-- 运行日志为 `/mnt/flash/arista-dashboard/dashboard.log`；超过阈值时启动包装器将其轮转为单个 `.1` 文件。
-- 进程 PID 位于 `/mnt/flash/arista-dashboard/dashboard.pid`。运维时只能在核对 `/proc/<pid>/cmdline` 后操作该 PID，禁止使用宽泛的 `pkill`。
+- 运行日志为 `/persist/secure/arista-dashboard/dashboard.log`；超过阈值时启动包装器将其轮转为单个 `.1` 文件。
+- 进程 PID 位于 `/persist/secure/arista-dashboard/dashboard.pid`。运维时只能在核对 `/proc/<pid>/cmdline` 后操作该 PID，禁止使用宽泛的 `pkill`。
 - 安装器会保存并更新 EOS event-handler，但不会执行设备重启。可用以下命令静态检查：
 
 ```text
