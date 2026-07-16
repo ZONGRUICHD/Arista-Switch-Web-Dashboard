@@ -245,6 +245,7 @@ class InstallerContractTests(unittest.TestCase):
         capture = self.function_text("capture_event_handler")
         configure = self.function_text("configure_startup")
         verify = self.function_text("verify_event_handler_matches")
+        normalize = self.function_text("normalize_event_handler_file")
         self.assertIn('show running-config section event-handler $EVENT_HANDLER', capture)
         self.assertIn('> "$event_backup_tmp"', capture)
         self.assertRegex(
@@ -256,6 +257,7 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('show running-config section event-handler $EVENT_HANDLER', verify)
         self.assertIn('> "${event_verify_tmp}.raw" 2>&1', verify)
         self.assertIn('cmp -s "${event_verify_tmp}.actual" "${event_verify_tmp}.expected"', verify)
+        self.assertIn("s/^[[:space:]]*//", normalize)
 
         main = self.script[self.script.index('[ -n "$REF" ]') :]
         self.assertLess(main.index("capture_event_handler"), main.index("transaction_active=1"))
@@ -264,6 +266,35 @@ class InstallerContractTests(unittest.TestCase):
         committed = main.index("transaction_active=0", installed)
         self.assertLess(configure_call, installed)
         self.assertLess(installed, committed)
+
+    def test_event_handler_normalization_strips_eos_indentation(self):
+        normalize = self.function_text("normalize_event_handler_file")
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "raw"
+            target = Path(temp) / "normalized"
+            source.write_text(
+                "event-handler codex-webui-start\n"
+                "   trigger on-boot   \n"
+                "   action bash /persist/secure/arista-dashboard/start-dashboard.sh\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            harness = "\n".join(
+                [
+                    normalize,
+                    "normalize_event_handler_file %s %s"
+                    % (shlex.quote(self.shell_path(source)), shlex.quote(self.shell_path(target))),
+                    "cat %s" % shlex.quote(self.shell_path(target)),
+                ]
+            )
+            result = self.run_shell(harness)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                result.stdout,
+                "event-handler codex-webui-start\n"
+                "trigger on-boot\n"
+                "action bash /persist/secure/arista-dashboard/start-dashboard.sh\n",
+            )
 
     def test_backup_pruning_is_prefix_bounded_and_keeps_two(self):
         prune = self.function_text("prune_backups")

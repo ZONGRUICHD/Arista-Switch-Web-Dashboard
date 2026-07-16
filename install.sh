@@ -512,7 +512,7 @@ capture_event_handler() {
 normalize_event_handler_file() {
   normalize_source="$1"
   normalize_target="$2"
-  sed -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*!/d' \
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*!/d' \
     "$normalize_source" > "$normalize_target"
 }
 
@@ -1017,11 +1017,18 @@ mv "$tmp" "$APP_PATH"
 tmp=""
 rotate_log "$LOG"
 
-if ! sh "$wrapper_tmp" || ! wait_for_health "https://$TLS_IP:$PORT/healthz"; then
+if ! sh "$wrapper_tmp"; then
+  echo "ERROR: production wrapper could not launch the candidate artifact." >&2
+  rollback_install
+  exit 1
+fi
+if ! wait_for_health "https://$TLS_IP:$PORT/healthz"; then
+  echo "ERROR: production HTTPS health did not match the pinned commit and artifact digest." >&2
   rollback_install
   exit 1
 fi
 if ! chmod 600 "$PID_FILE"; then
+  echo "ERROR: production PID file is missing or could not be secured." >&2
   rollback_install
   exit 1
 fi
@@ -1034,6 +1041,7 @@ mv "$release_tmp" "$RELEASE_FILE"
 release_tmp=""
 
 if ! configure_startup; then
+  echo "ERROR: EOS on-boot event-handler configuration or readback verification failed." >&2
   rollback_install
   exit 1
 fi
