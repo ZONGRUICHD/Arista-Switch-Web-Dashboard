@@ -57,6 +57,7 @@ class InstallerContractTests(unittest.TestCase):
                 "REF": "a" * 40,
                 "ARTIFACT_SHA": "b" * 64,
                 "APP_URL": "",
+                "APP_SOURCE": "",
                 "APP_PATH": posix_root + "/app.py",
                 "STATE_DIR": posix_root + "/state",
                 "AUTH_CONFIG": posix_root + "/state/auth.json",
@@ -178,6 +179,17 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('wait_for_health "https://$TLS_IP:$PORT/healthz"', self.script)
         self.assertIn('wait_for_expected_health "https://$TLS_IP:$PORT/healthz"', self.script)
         self.assertNotIn('https://127.0.0.1:$PORT/healthz', self.script)
+
+    def test_offline_source_remains_commit_and_digest_pinned(self):
+        main = self.script[self.script.index('[ -n "$REF" ]') :]
+        source_guard = main.index('[ -f "$APP_SOURCE" ] && [ -r "$APP_SOURCE" ]')
+        mutation = main.index('mkdir -p "$STATE_DIR"')
+        digest = main.index('actual_sha="$(sha256_file "$tmp"')
+        self.assertLess(source_guard, mutation)
+        self.assertIn('cp "$APP_SOURCE" "$tmp"', main)
+        self.assertLess(main.index('cp "$APP_SOURCE" "$tmp"'), digest)
+        self.assertIn('[ -z "$APP_URL" ] || die "Set only one of APP_SOURCE or APP_URL."', main)
+        self.assertIn('if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then', main)
 
     def test_legacy_rollback_deliberately_leaves_http_app_stopped(self):
         restart = self.function_text("restart_previous")

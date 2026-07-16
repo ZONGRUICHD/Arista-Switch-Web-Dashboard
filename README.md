@@ -84,6 +84,16 @@ curl -fL "https://raw.githubusercontent.com/ZONGRUICHD/Arista-Switch-Web-Dashboa
 REF="$REF" ARTIFACT_SHA="$ARTIFACT_SHA" sh /tmp/arista-dashboard-install.sh
 ```
 
+若交换机管理 VRF 无法解析或访问 GitHub，可先通过受信任的 SSH/SCP 通道把同一 commit 的 `onbox/arista7050_web.py` 传到临时路径，再使用离线源；安装器仍会在任何切换前校验 `ARTIFACT_SHA`：
+
+```sh
+REF="$REF" ARTIFACT_SHA="$ARTIFACT_SHA" \
+APP_SOURCE=/tmp/arista7050-web-reviewed.py \
+  sh /tmp/arista-dashboard-install.sh
+```
+
+`APP_SOURCE` 和 `APP_URL` 互斥。离线文件必须是普通可读文件，且其 SHA-256 必须与已审核 commit 的 Git 对象一致。
+
 首次安装会从 `/dev/tty` 提示输入 EOS/Dashboard 密码。密码不会作为命令行参数、环境变量或日志内容出现。安装器默认执行以下流程：
 
 1. 检查 Python、OpenSSL、下载工具、写权限和至少 8 MiB 可用空间。

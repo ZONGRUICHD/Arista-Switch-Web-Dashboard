@@ -9,6 +9,7 @@ REPO="${REPO:-ZONGRUICHD/Arista-Switch-Web-Dashboard}"
 REF="${REF:-}"
 ARTIFACT_SHA="${ARTIFACT_SHA:-}"
 APP_URL="${APP_URL:-}"
+APP_SOURCE="${APP_SOURCE:-}"
 
 APP_PATH="${APP_PATH:-/mnt/flash/arista7050_web.py}"
 STATE_DIR="${STATE_DIR:-/mnt/flash/arista-dashboard}"
@@ -714,6 +715,9 @@ esac
 
 validate_safe_value REPO "$REPO"
 validate_safe_value REF "$REF"
+if [ -n "$APP_SOURCE" ]; then
+  validate_safe_value APP_SOURCE "$APP_SOURCE"
+fi
 validate_safe_value APP_PATH "$APP_PATH"
 validate_safe_value STATE_DIR "$STATE_DIR"
 validate_safe_value AUTH_CONFIG "$AUTH_CONFIG"
@@ -748,8 +752,13 @@ case "$STARTUP" in 1|true|yes) startup_enabled=1 ;; *) startup_enabled=0 ;; esac
 [ "$MIN_FREE_KB" -ge 1 ] || die "MIN_FREE_KB must be at least 1."
 [ "$MAX_LOG_BYTES" -ge 1 ] || die "MAX_LOG_BYTES must be at least 1."
 [ "$HEALTH_ATTEMPTS" -ge 1 ] || die "HEALTH_ATTEMPTS must be at least 1."
-[ -n "$APP_URL" ] || APP_URL="https://raw.githubusercontent.com/$REPO/$REF/onbox/arista7050_web.py"
-case "$APP_URL" in https://*) ;; *) die "APP_URL must use HTTPS." ;; esac
+if [ -n "$APP_SOURCE" ]; then
+  [ -z "$APP_URL" ] || die "Set only one of APP_SOURCE or APP_URL."
+  [ -f "$APP_SOURCE" ] && [ -r "$APP_SOURCE" ] || die "APP_SOURCE must be a readable regular file."
+else
+  [ -n "$APP_URL" ] || APP_URL="https://raw.githubusercontent.com/$REPO/$REF/onbox/arista7050_web.py"
+  case "$APP_URL" in https://*) ;; *) die "APP_URL must use HTTPS." ;; esac
+fi
 
 require_command "$PYTHON"
 require_command openssl
@@ -794,7 +803,12 @@ note "Target: $APP_PATH"
 note "HTTPS listener: $HOST:$PORT"
 
 tmp="${APP_PATH}.download.$$"
-download "$APP_URL" "$tmp"
+if [ -n "$APP_SOURCE" ]; then
+  note "Using locally transferred artifact: $APP_SOURCE"
+  cp "$APP_SOURCE" "$tmp" || die "Unable to copy APP_SOURCE into the verified staging path."
+else
+  download "$APP_URL" "$tmp"
+fi
 actual_sha="$(sha256_file "$tmp" | tr 'A-F' 'a-f')"
 expected_sha="$(printf '%s' "$ARTIFACT_SHA" | tr 'A-F' 'a-f')"
 [ "$actual_sha" = "$expected_sha" ] || die "Artifact digest mismatch: got $actual_sha."
