@@ -191,6 +191,12 @@ class InstallerContractTests(unittest.TestCase):
         self.assertIn('[ -z "$APP_URL" ] || die "Set only one of APP_SOURCE or APP_URL."', main)
         self.assertIn('if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then', main)
 
+    def test_root_is_required_before_filesystem_mutation(self):
+        main = self.script[self.script.index('[ -n "$REF" ]') :]
+        root_guard = main.index('[ "$installer_uid" = "0" ] || die "Installer must run as root')
+        self.assertLess(root_guard, main.index('mkdir -p "$STATE_DIR"'))
+        self.assertLess(root_guard, main.index(': > "$LOG"'))
+
     def test_legacy_rollback_deliberately_leaves_http_app_stopped(self):
         restart = self.function_text("restart_previous")
         self.assertIn('sh "$WRAPPER_PATH"', restart)

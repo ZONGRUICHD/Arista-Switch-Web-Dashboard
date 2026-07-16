@@ -752,6 +752,8 @@ case "$STARTUP" in 1|true|yes) startup_enabled=1 ;; *) startup_enabled=0 ;; esac
 [ "$MIN_FREE_KB" -ge 1 ] || die "MIN_FREE_KB must be at least 1."
 [ "$MAX_LOG_BYTES" -ge 1 ] || die "MAX_LOG_BYTES must be at least 1."
 [ "$HEALTH_ATTEMPTS" -ge 1 ] || die "HEALTH_ATTEMPTS must be at least 1."
+installer_uid="$(id -u 2>/dev/null || true)"
+[ "$installer_uid" = "0" ] || die "Installer must run as root (on EOS, use: sudo -n env ... sh install.sh)."
 if [ -n "$APP_SOURCE" ]; then
   [ -z "$APP_URL" ] || die "Set only one of APP_SOURCE or APP_URL."
   [ -f "$APP_SOURCE" ] && [ -r "$APP_SOURCE" ] || die "APP_SOURCE must be a readable regular file."
